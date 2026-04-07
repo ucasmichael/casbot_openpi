@@ -1,0 +1,119 @@
+['LJ0', 'LJ1', 'LJ2', 'LJ3', 'LJUP', 'LJDOWN', 'LJPITCH', 'LJROLL', 
+   'RJ6', 'RJ7', 'RJ8', 'RJ9', 'RJUP', 'RJDOWN', 'RJPITCH', 'RJROLL', 
+   'left_shoulder_pitch', 'left_shoulder_roll', 'left_shoulder_yaw', 
+   'left_elbow_pitch', 'left_wrist_yaw', 'left_wrist_pitch', 'left_wrist_roll', 
+   'right_shoulder_pitch', 'right_shoulder_roll', 'right_shoulder_yaw',
+    'right_elbow_pitch', 'right_wrist_yaw', 'right_wrist_pitch', 'right_wrist_roll', 
+    'head_yaw', 'head_pitch', 'waist_yaw', 'left_thumb_metacarpal', 'left_thumb_proximal', 
+    'left_index_proximal', 'left_index_distal', 'left_middle_proximal', 
+    'left_middle_distal', 'left_ring_proximal', 'left_ring_distal', 'left_pinky_proximal',
+    'left_pinky_distal', 'right_thumb_metacarpal', 'right_thumb_proximal', 
+    'right_index_proximal', 'right_index_distal', 'right_middle_proximal', 
+    'right_middle_distal', 'right_ring_proximal', 
+    'right_ring_distal', 'right_pinky_proximal', 'right_pinky_distal']
+# [16:16+21] [-11:-9] [-8:-6]
+
+['left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 
+'left_elbow_pitch_joint', 'left_wrist_yaw_joint', 'left_wrist_pitch_joint',
+ 'left_wrist_roll_joint', 'right_shoulder_pitch_joint', 'right_shoulder_roll_joint',
+ 'right_shoulder_yaw_joint', 'right_elbow_pitch_joint', 'right_wrist_yaw_joint',
+   'right_wrist_pitch_joint', 'right_wrist_roll_joint', 'head_yaw_joint',
+    'head_pitch_joint', 'left_thumb_metacarpal_joint', 'left_thumb_proximal_joint',
+     'left_thumb_distal_joint', 'left_index_proximal_joint', 'left_index_distal_joint',
+      'left_middle_proximal_joint', 'left_middle_distal_joint', 
+      'left_ring_proximal_joint', 'left_ring_distal_joint', 'left_pinky_proximal_joint', 
+      'left_pinky_distal_joint', 'right_thumb_metacarpal_joint',
+       'right_thumb_proximal_joint', 'right_thumb_distal_joint', 
+       'right_index_proximal_joint', 'right_index_distal_joint',
+        'right_middle_proximal_joint', 'right_middle_distal_joint', 
+        'right_ring_proximal_joint', 'right_ring_distal_joint',
+         'right_pinky_proximal_joint', 'right_pinky_distal_joint']
+# [:21] [-11:-9] [-8:-6]
+
+[Dataset] actions | dtype=float32 | shape=(2608, 38)
+[Group]   observations
+[Group]   observations/images
+[Dataset] observations/images/casbot_camera_chest_color | dtype=uint8 | shape=(2608, 360, 640, 3)
+[Dataset] observations/images/casbot_camera_stereo_color | dtype=uint8 | shape=(2608, 360, 640, 3)
+[Dataset] observations/qpos | dtype=float32 | shape=(2608, 53)
+
+# max-min [2.5336485 1.429001  1.7538323 1.8675    1.71734   1.3254713 2.56745
+ 2.350783  1.2407489 1.8664849 1.8234432 2.2496207 1.2635392 1.7614415
+ 0.6723194 1.201219  0.12      0.58      0.53      0.65      0.73
+ 0.        0.        0.        0.        0.        0.        0.13
+ 0.58      0.53      0.65      0.73      0.        0.        0.
+ 0.        0.        0.       ]
+
+# 问题：right_thumb_distal 没有对应的state
+
+state:
+['left_shoulder_pitch', 'left_shoulder_roll', 'left_shoulder_yaw', 
+   'left_elbow_pitch', 'left_wrist_yaw', 'left_wrist_pitch', 'left_wrist_roll', 
+   'right_shoulder_pitch', 'right_shoulder_roll', 'right_shoulder_yaw',
+    'right_elbow_pitch', 'right_wrist_yaw', 'right_wrist_pitch', 'right_wrist_roll', 
+    'head_yaw', 'head_pitch', 'left_thumb_metacarpal', 'left_thumb_proximal', 
+    'left_index_proximal', 'left_index_distal', 'right_thumb_metacarpal', 'right_thumb_proximal', 
+    'right_index_proximal', 'right_index_distal']
+
+action:
+['left_shoulder_pitch_joint', 
+                'left_shoulder_roll_joint', 
+                'left_shoulder_yaw_joint', 
+                'left_elbow_pitch_joint', 
+                'left_wrist_yaw_joint', 
+                'left_wrist_pitch_joint',
+                'left_wrist_roll_joint',
+                'right_shoulder_pitch_joint', 
+                'right_shoulder_roll_joint',
+                'right_shoulder_yaw_joint', 
+                'right_elbow_pitch_joint', 
+                'right_wrist_yaw_joint',
+                'right_wrist_pitch_joint', 
+                'right_wrist_roll_joint', 
+                'head_yaw_joint',
+                'head_pitch_joint', 
+                'left_thumb_metacarpal_joint', 
+                'left_thumb_proximal_joint',
+                # 'left_thumb_distal_joint', 
+                'left_index_proximal_joint', 
+                'left_index_distal_joint',
+                
+                'right_thumb_metacarpal_joint',
+                'right_thumb_proximal_joint', 
+                # 'right_thumb_distal_joint', 
+                'right_index_proximal_joint', 
+                'right_index_distal_joint']
+
+对于上述的action与state，分别对每个元素查找在
+action:
+['left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 
+'left_elbow_pitch_joint', 'left_wrist_yaw_joint', 'left_wrist_pitch_joint',
+ 'left_wrist_roll_joint', 'right_shoulder_pitch_joint', 'right_shoulder_roll_joint',
+ 'right_shoulder_yaw_joint', 'right_elbow_pitch_joint', 'right_wrist_yaw_joint',
+   'right_wrist_pitch_joint', 'right_wrist_roll_joint', 'head_yaw_joint',
+    'head_pitch_joint', 'left_thumb_metacarpal_joint', 'left_thumb_proximal_joint',
+     'left_thumb_distal_joint', 'left_index_proximal_joint', 'left_index_distal_joint',
+      'left_middle_proximal_joint', 'left_middle_distal_joint', 
+      'left_ring_proximal_joint', 'left_ring_distal_joint', 'left_pinky_proximal_joint', 
+      'left_pinky_distal_joint', 'right_thumb_metacarpal_joint',
+       'right_thumb_proximal_joint', 'right_thumb_distal_joint', 
+       'right_index_proximal_joint', 'right_index_distal_joint',
+        'right_middle_proximal_joint', 'right_middle_distal_joint', 
+        'right_ring_proximal_joint', 'right_ring_distal_joint',
+         'right_pinky_proximal_joint', 'right_pinky_distal_joint']
+与
+state
+['LJ0', 'LJ1', 'LJ2', 'LJ3', 'LJUP', 'LJDOWN', 'LJPITCH', 'LJROLL', 
+   'RJ6', 'RJ7', 'RJ8', 'RJ9', 'RJUP', 'RJDOWN', 'RJPITCH', 'RJROLL', 
+   'left_shoulder_pitch', 'left_shoulder_roll', 'left_shoulder_yaw', 
+   'left_elbow_pitch', 'left_wrist_yaw', 'left_wrist_pitch', 'left_wrist_roll', 
+   'right_shoulder_pitch', 'right_shoulder_roll', 'right_shoulder_yaw',
+    'right_elbow_pitch', 'right_wrist_yaw', 'right_wrist_pitch', 'right_wrist_roll', 
+    'head_yaw', 'head_pitch', 'waist_yaw', 'left_thumb_metacarpal', 'left_thumb_proximal', 
+    'left_index_proximal', 'left_index_distal', 'left_middle_proximal', 
+    'left_middle_distal', 'left_ring_proximal', 'left_ring_distal', 'left_pinky_proximal',
+    'left_pinky_distal', 'right_thumb_metacarpal', 'right_thumb_proximal', 
+    'right_index_proximal', 'right_index_distal', 'right_middle_proximal', 
+    'right_middle_distal', 'right_ring_proximal', 
+    'right_ring_distal', 'right_pinky_proximal', 'right_pinky_distal']
+里面的id(索引)，并打印出action id与state id 的列表（24维）
