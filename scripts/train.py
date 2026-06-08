@@ -100,8 +100,9 @@ def init_train_state(
             model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)
-        # Convert frozen params to bfloat16.
-        params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+        # Convert permanently frozen params to bfloat16.
+        if config.cast_frozen_params_to_bfloat16:
+            params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
         return training_utils.TrainState(
             step=0,
@@ -131,6 +132,15 @@ def init_train_state(
     )(init_rng, partial_params)
 
     return train_state, state_sharding
+
+
+def reinit_optimizer_state(
+    config: _config.TrainConfig,
+    state: training_utils.TrainState,
+) -> training_utils.TrainState:
+    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+    params = state.params.filter(config.trainable_filter)
+    return dataclasses.replace(state, tx=tx, opt_state=tx.init(params))
 
 
 @at.typecheck
@@ -240,12 +250,39 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    post_unfreeze_config = None
+    post_unfreeze_train_state_sharding = None
+    pre_unfreeze_train_state_sharding = train_state_sharding
+    if config.unfreeze_at_step is not None:
+        post_unfreeze_config = dataclasses.replace(config, freeze_filter=config.freeze_filter_after_unfreeze)
+        _, post_unfreeze_train_state_sharding = init_train_state(post_unfreeze_config, init_rng, mesh, resume=True)
+        logging.info(
+            "Staged unfreeze enabled: using freeze_filter until step %d, then switching to freeze_filter_after_unfreeze",
+            config.unfreeze_at_step,
+        )
+
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    ptrain_step_after_unfreeze = None
+    preinit_optimizer_after_unfreeze = None
+    if post_unfreeze_config is not None:
+        assert post_unfreeze_train_state_sharding is not None
+        ptrain_step_after_unfreeze = jax.jit(
+            functools.partial(train_step, post_unfreeze_config),
+            in_shardings=(replicated_sharding, post_unfreeze_train_state_sharding, data_sharding),
+            out_shardings=(post_unfreeze_train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
+        preinit_optimizer_after_unfreeze = jax.jit(
+            functools.partial(reinit_optimizer_state, post_unfreeze_config),
+            in_shardings=(pre_unfreeze_train_state_sharding,),
+            out_shardings=(post_unfreeze_train_state_sharding,),
+            donate_argnums=(0,),
+        )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -257,6 +294,19 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
+        if (
+            config.unfreeze_at_step is not None
+            and step == config.unfreeze_at_step
+            and post_unfreeze_config is not None
+        ):
+            assert ptrain_step_after_unfreeze is not None
+            assert preinit_optimizer_after_unfreeze is not None
+            logging.info("Unfreezing staged parameters at step %d and reinitializing optimizer state", step)
+            train_state = preinit_optimizer_after_unfreeze(train_state)
+            jax.block_until_ready(train_state)
+            ptrain_step = ptrain_step_after_unfreeze
+            train_state_sharding = post_unfreeze_train_state_sharding
+
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)

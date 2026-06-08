@@ -19,22 +19,29 @@ def convert_one(args):
 
 
 if __name__ == "__main__":
-    root = "/opt/lyx/mcap_datasets/data0402"
-    save_root = "/opt/lyx/casbot_dataset/local_dataset/hdf5_dataset/casbot"
+    roots = ["/data/lyx/dataset/mcap/data_white_desk",
+             "/data/lyx/dataset/mcap/data_white_desk2",
+             "/data/lyx/dataset/mcap/data_white_desk2_0",
+             "/data/lyx/dataset/mcap/data_white_desk2_1",
+             "/data/lyx/dataset/mcap/data_white_desk2_2",
+             "/data/lyx/dataset/mcap/data_white_desk2_3",
+             "/data/lyx/dataset/mcap/data_white_desk2_4",
+             "/data/lyx/dataset/mcap/data_white_desk2_5",]
+    save_root = "/data/lyx/casbot_dataset/local_dataset/hdf5_dataset/casbot01"
     os.makedirs(save_root, exist_ok=True)
 
-    files = sorted(os.listdir(root))
-
     tasks = []
-    for i, file in enumerate(files):
-        mcap_file_name = os.path.join(root, file)
-        save_path = os.path.join(save_root, f"episode_{i}_4_2.hdf5")
-        tasks.append((i, mcap_file_name, save_path))
+    for root in roots:
+        files = sorted(os.listdir(root))
+        for file in files:
+            mcap_file_name = os.path.join(root, file)
+            save_path = os.path.join(save_root, f"episode_{len(tasks)}_0601.hdf5")
+            tasks.append((len(tasks), mcap_file_name, save_path))
 
     # 进程数
     """for i in range(5):
         convert_one(tasks[i])"""
-    num_workers = min(8, os.cpu_count()//2)
+    num_workers = min(16, os.cpu_count()//2)
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(convert_one, t) for t in tasks]

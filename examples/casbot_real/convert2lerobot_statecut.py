@@ -298,6 +298,10 @@ def load_raw_episode_data(
         state_indices = get_joint_indices(ALL_STATES, VALID_STATES)
         print(f"状态索引: {state_indices}")
         state = raw_state[:, state_indices]
+        # Flip head_yaw and head_pitch signs for state
+        state[:, 14] = -state[:, 14]  # head_yaw
+        state[:, 15] = -state[:, 15]  # head_pitch
+        state[:, 14], state[:, 15] = state[:, 15], state[:, 14]  # swap head_yaw and head_pitch
 
         assert state.shape[1] == ACTION_DIM and action.shape[1] == ACTION_DIM
         

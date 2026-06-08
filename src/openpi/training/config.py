@@ -22,6 +22,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.casbot_policy as casbot_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -538,6 +539,10 @@ class TrainConfig:
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
+    # If set, training starts with freeze_filter and switches to freeze_filter_after_unfreeze at this step.
+    unfreeze_at_step: int | None = None
+    freeze_filter_after_unfreeze: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
+    cast_frozen_params_to_bfloat16: bool = True
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
@@ -598,6 +603,11 @@ class TrainConfig:
         """Get the filter for the trainable parameters."""
         return nnx.All(nnx.Param, nnx.Not(self.freeze_filter))
 
+    @property
+    def trainable_filter_after_unfreeze(self) -> nnx.filterlib.Filter:
+        """Get the filter for trainable parameters after staged unfreeze."""
+        return nnx.All(nnx.Param, nnx.Not(self.freeze_filter_after_unfreeze))
+
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
@@ -609,6 +619,16 @@ def make_model_config(action_horizon=10, pi05=True):
         pi05=pi05,
         # paligemma_variant="gemma_2b_lora",
         # action_expert_variant="gemma_300m_lora"
+    )
+
+def make_pi0_vlm_freeze_filter() -> nnx.filterlib.Filter:
+    """Freeze the PaliGemma VLM while leaving the action expert and action head trainable."""
+    return nnx.Any(
+        nnx_utils.PathRegex(".*PaliGemma/img.*"),
+        nnx.All(
+            nnx_utils.PathRegex(".*PaliGemma/llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*PaliGemma/llm.*_1.*")),
+        ),
     )
 
 def make_data_config(repo_id: str, prompt: str, prompt_from_task=True, use_delta_joint_actions=False):
@@ -1273,7 +1293,46 @@ _CONFIGS = [
         name="casbot_fold_cloth",
         model=make_model_config(action_horizon=50),
         data=LeRobotCasbotDataConfig(
-        repo_id="local_dataset/casbot_0328", # local_dataset/casbot
+        repo_id="local_dataset/casbot_white_board", # local_dataset/casbot_white_board ; local_dataset/casbot_0328
+        default_prompt="fold the cloth",
+        use_delta_joint_actions = False,
+        base_config=DataConfig(
+            local_files_only=True,
+            prompt_from_task=True,
+        ),
+        repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_low": "observation.images.casbot_camera_chest_color",
+                                "cam_high": "observation.images.casbot_camera_stereo_color",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+        ),
+        pytorch_weight_path = None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/lyx/casbot_openpi/checkpoints/casbot_fold_cloth/casbot_fold_cloth/60000/params"),
+        # /data/lyx/casbot_openpi/checkpoints/casbot_fold_cloth/casbot_fold_cloth/60000/params
+        # gs://openpi-assets/checkpoints/pi05_base/params
+        freeze_filter=make_model_config(action_horizon=50).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=50_000,
+        wandb_enabled=True,
+        batch_size=32,
+        save_interval=20_000,
+        # lr_schedule= _optimizer.CosineDecaySchedule if lr_schedule is None else lr_schedule,
+    ),
+    TrainConfig(
+        name="casbot_fold_cloth_vlm_warmup",
+        model=make_model_config(action_horizon=50),
+        data=LeRobotCasbotDataConfig(
+        repo_id="local_dataset/casbot_white_board", # local_dataset/casbot_white_board ; local_dataset/casbot_0328
         default_prompt="fold the cloth",
         use_delta_joint_actions = False,
         base_config=DataConfig(
@@ -1298,13 +1357,21 @@ _CONFIGS = [
         ),
         pytorch_weight_path = None,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        freeze_filter=make_model_config(action_horizon=50).get_freeze_filter(),
+        freeze_filter=make_pi0_vlm_freeze_filter(),
+        unfreeze_at_step=5_000,
+        freeze_filter_after_unfreeze=nnx.Nothing,
+        cast_frozen_params_to_bfloat16=False,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+            decay_lr=2.5e-6,
+        ),
         ema_decay=None,
-        num_train_steps=70_000,
+        num_train_steps=50_000,
         wandb_enabled=True,
         batch_size=32,
-        save_interval=50_000,
-        # lr_schedule= _optimizer.CosineDecaySchedule if lr_schedule is None else lr_schedule,
+        save_interval=20_000,
     ),
     TrainConfig(
         name="casbot_fold_cloth_single_view",

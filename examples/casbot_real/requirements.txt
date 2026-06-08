@@ -1,0 +1,5 @@
+numpy
+h5py
+opencv-python
+mcap
+mcap-ros2-support
