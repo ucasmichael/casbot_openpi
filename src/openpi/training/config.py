@@ -17,10 +17,11 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+import openpi.policies.a3_policy as a3_policy
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.casbot_policy as casbot_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
-import openpi.policies.casbot_policy as casbot_policy
 import openpi.shared.download as _download
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
@@ -412,6 +413,54 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotA3DataConfig(DataConfigFactory):
+    use_delta_joint_actions: bool = False
+    default_prompt: str | None = None
+    action_dim: int = a3_policy.A3_ACTION_DIM
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "chest_rgb": "observation.images.chest_front_rgb",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[a3_policy.A3Inputs(model_type=model_config.model_type)],
+            outputs=[a3_policy.A3Outputs(action_dim=self.action_dim)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(self.action_dim)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -658,9 +707,9 @@ def make_data_config(repo_id: str, prompt: str, prompt_from_task=True, use_delta
             ]
         ),
     )
-def make_train_config(name, repo_id, prompt, steps, action_horizon=16, model_path="gs://openpi-assets/checkpoints/pi05_base/params", batch_size=64, save_interval=1000, 
+def make_train_config(name, repo_id, prompt, steps, action_horizon=16, model_path="gs://openpi-assets/checkpoints/pi05_base/params", batch_size=64, save_interval=1000,
                       prompt_from_task=True, use_delta_joint_actions=False, pi05=True, use_pytorch=None, lr_schedule=None):
-    
+
     model_cfg = make_model_config(action_horizon, pi05)
     return TrainConfig(
         name=name,
@@ -675,6 +724,42 @@ def make_train_config(name, repo_id, prompt, steps, action_horizon=16, model_pat
         batch_size=batch_size,
         save_interval=save_interval,
         # lr_schedule= _optimizer.CosineDecaySchedule if lr_schedule is None else lr_schedule,
+    )
+
+
+def make_a3_train_config(
+    name: str,
+    repo_id: str,
+    action_dim: int,
+    prompt: str = "test",
+    steps: int = 30_000,
+    action_horizon: int = 25,
+    batch_size: int = 32,
+    save_interval: int = 10_000,
+    model_path: str = "gs://openpi-assets/checkpoints/pi05_base/params",
+):
+    model_cfg = pi0_config.Pi0Config(action_dim=action_dim, action_horizon=action_horizon, pi05=True)
+    return TrainConfig(
+        name=name,
+        model=model_cfg,
+        data=LeRobotA3DataConfig(
+            repo_id=repo_id,
+            action_dim=action_dim,
+            default_prompt=prompt,
+            use_delta_joint_actions=False,
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader(model_path),
+        pytorch_weight_path=None,
+        freeze_filter=model_cfg.get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=steps,
+        wandb_enabled=True,
+        batch_size=batch_size,
+        save_interval=save_interval,
     )
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1151,7 +1236,7 @@ _CONFIGS = [
         prompt_from_task=False,
         use_delta_joint_actions=True
     ),
-    
+
     #
 
     make_train_config(
@@ -1409,6 +1494,24 @@ _CONFIGS = [
         batch_size=32,
         save_interval=20_000,
         # lr_schedule= _optimizer.CosineDecaySchedule if lr_schedule is None else lr_schedule,
+    ),
+    make_a3_train_config(
+        name="pi05_a3_left",
+        repo_id="local_dataset/a3_0730_test_left",
+        action_dim=a3_policy.A3_ONE_SIDE_ACTION_DIM,
+        prompt="test",
+    ),
+    make_a3_train_config(
+        name="pi05_a3_right",
+        repo_id="local_dataset/a3_0730_test_right",
+        action_dim=a3_policy.A3_ONE_SIDE_ACTION_DIM,
+        prompt="test",
+    ),
+    make_a3_train_config(
+        name="pi05_a3_both",
+        repo_id="local_dataset/a3_0730_test_both",
+        action_dim=a3_policy.A3_BOTH_ACTION_DIM,
+        prompt="test",
     ),
     #
     # RoboArena configs.

@@ -55,6 +55,22 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class PartialCheckpointWeightLoader(WeightLoader):
+    """Loads checkpoint leaves whose shapes match the initialized model.
+
+    This is useful when fine-tuning a base checkpoint with a changed action_dim:
+    most VLM/action-expert weights can still be reused, while action-dependent
+    input/output heads are left at their freshly initialized shapes.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        return _merge_params_by_shape(loaded_params, params)
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 
@@ -100,5 +116,32 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     for k in {k for k in flat_ref if pattern.fullmatch(k)}:
         if k not in result:
             result[k] = flat_ref[k]
+
+    return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
+def _merge_params_by_shape(loaded_params: at.Params, params: at.Params) -> at.Params:
+    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+
+    result = {}
+    skipped = []
+    for key, ref_value in flat_ref.items():
+        loaded_value = flat_loaded.get(key)
+        if loaded_value is None:
+            result[key] = ref_value
+            continue
+
+        if tuple(loaded_value.shape) != tuple(ref_value.shape):
+            skipped.append((key, loaded_value.shape, ref_value.shape))
+            result[key] = ref_value
+            continue
+
+        result[key] = loaded_value.astype(ref_value.dtype) if loaded_value.dtype != ref_value.dtype else loaded_value
+
+    if skipped:
+        logger.info("Skipped %d checkpoint leaves with mismatched shapes.", len(skipped))
+        for key, loaded_shape, ref_shape in skipped[:20]:
+            logger.info("Skipped %s: checkpoint %s != model %s", key, loaded_shape, ref_shape)
 
     return flax.traverse_util.unflatten_dict(result, sep="/")

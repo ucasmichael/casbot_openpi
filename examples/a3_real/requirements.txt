@@ -1,0 +1,4 @@
+mcap
+mcap-ros2-support
+numpy
+lerobot
