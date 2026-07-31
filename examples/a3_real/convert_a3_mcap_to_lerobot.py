@@ -338,14 +338,50 @@ def create_dataset(
     )
 
 
-def print_qpose_means(name: str, values: list[np.ndarray], joint_names: list[str] | None = None) -> None:
+def qpose_mean_record(values: list[np.ndarray], joint_names: list[str] | None = None) -> dict[str, Any] | None:
     if not values:
-        return
+        return None
     mean = np.stack(values, axis=0).mean(axis=0)
-    print(f"\n{name} mean, dim={mean.shape[0]}:")
-    for idx, value in enumerate(mean):
+    names = []
+    for idx in range(mean.shape[0]):
         joint_name = joint_names[idx] if joint_names is not None and idx < len(joint_names) else f"dim_{idx}"
+        names.append(joint_name)
+    return {
+        "dim": int(mean.shape[0]),
+        "frame_count": len(values),
+        "joint_names": names,
+        "mean": mean.astype(float).tolist(),
+    }
+
+
+def print_qpose_means(name: str, record: dict[str, Any] | None) -> None:
+    if record is None:
+        return
+    print(f"\n{name} mean, dim={record['dim']}:")
+    for idx, value in enumerate(record["mean"]):
+        joint_name = record["joint_names"][idx]
         print(f"  [{idx:02d}] {joint_name}: {value:.6f}")
+
+
+def write_qpose_mean_json(
+    dataset_root: Path,
+    *,
+    joint_mode: JointMode,
+    selected: list[np.ndarray],
+    selected_names: list[str],
+    excluded: dict[str, list[np.ndarray]],
+    excluded_names: dict[str, list[str]],
+) -> dict[str, Any]:
+    stats = {
+        "joint_mode": joint_mode,
+        "training_qpose": qpose_mean_record(selected, selected_names),
+        "excluded_qpose": {
+            name: qpose_mean_record(values, excluded_names.get(name)) for name, values in sorted(excluded.items())
+        },
+    }
+    stats_path = dataset_root / "meta" / "qpose_means.json"
+    stats_path.write_text(json.dumps(stats, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return stats
 
 
 def convert(
@@ -420,9 +456,18 @@ def convert(
     print(f"Joint mode: {joint_mode}")
     print(f"Training state/action dim: {len(first.joint_names)}")
     print(f"RGB shape in LeRobot: {first.rgb_shape}")
-    print_qpose_means("training qpose", all_selected, first.joint_names)
-    for name, values in sorted(all_excluded.items()):
-        print_qpose_means(f"excluded {name} qpose", values, excluded_names.get(name))
+    qpose_stats = write_qpose_mean_json(
+        dataset.root,
+        joint_mode=joint_mode,
+        selected=all_selected,
+        selected_names=first.joint_names,
+        excluded=all_excluded,
+        excluded_names=excluded_names,
+    )
+    print_qpose_means("training qpose", qpose_stats["training_qpose"])
+    for name, record in sorted(qpose_stats["excluded_qpose"].items()):
+        print_qpose_means(f"excluded {name} qpose", record)
+    print(f"\nWrote qpose means: {dataset.root / 'meta' / 'qpose_means.json'}")
 
 
 def parse_args() -> argparse.Namespace:

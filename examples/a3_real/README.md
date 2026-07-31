@@ -113,6 +113,8 @@ task: 来自每个 episode 的 prompt.txt 或 metadata.json
 
 Depth 和 neck 保留在原始 MCAP 中，不进入训练数据。
 
+转换结束后，脚本会在 LeRobot 数据集的 `meta/qpose_means.json` 写入 `training_qpose` 和 `excluded_qpose` 的逐维均值、关节名和帧数；终端也会同步打印同样的均值，方便快速检查。
+
 ## 训练
 
 新增配置名：
@@ -128,15 +130,14 @@ pi05_a3_both
 ```bash
 cd /data/lyx/casbot_openpi
 export HF_LEROBOT_HOME=/data/lyx/dataset/lerobot
-
-.venv/bin/python scripts/compute_norm_stats.py pi05_a3_both
+export HF_DATASETS_CACHE=/data/lyx/hf_cache
+uv run scripts/compute_norm_stats.py --config-name pi05_a3_right 
 ```
 
 开始训练：
 
 ```bash
-.venv/bin/python scripts/train.py pi05_a3_both \
-  --exp_name a3_0730_test
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_a3_right --exp-name=pi05_a3_right_pick_cube --overwrite
 ```
 
 如果使用 PyTorch 训练入口：
