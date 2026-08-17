@@ -384,6 +384,18 @@ def write_qpose_mean_json(
     return stats
 
 
+def skip_record(raw_dir: Path, episode_dir: Path, reason: str) -> dict[str, Any]:
+    try:
+        source_relative = str(episode_dir.resolve().relative_to(raw_dir.resolve()))
+    except ValueError:
+        source_relative = str(episode_dir)
+    return {
+        "source": str(episode_dir),
+        "source_relative": source_relative,
+        "reason": reason,
+    }
+
+
 def convert(
     raw_dir: Path,
     repo_id: str,
@@ -405,12 +417,30 @@ def convert(
     if not episode_dirs:
         raise FileNotFoundError(f"No episodes found under {raw_dir}")
 
-    first = load_episode(
-        episode_dirs[0],
-        joint_mode=joint_mode,
-        sync_tolerance_ms=sync_tolerance_ms,
-        max_frames=max_frames_per_episode,
-    )
+    skipped_episodes: list[dict[str, Any]] = []
+    first: EpisodeData | None = None
+    first_episode_dir: Path | None = None
+    first_source_index: int | None = None
+    for source_index, episode_dir in enumerate(episode_dirs):
+        try:
+            first = load_episode(
+                episode_dir,
+                joint_mode=joint_mode,
+                sync_tolerance_ms=sync_tolerance_ms,
+                max_frames=max_frames_per_episode,
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            print(f"[skip source {source_index:03d}] {episode_dir}: {reason}")
+            skipped_episodes.append(skip_record(raw_dir, episode_dir, reason))
+            continue
+        first_episode_dir = episode_dir
+        first_source_index = source_index
+        break
+
+    if first is None or first_episode_dir is None or first_source_index is None:
+        raise RuntimeError(f"No valid episodes found under {raw_dir}")
+
     dataset = create_dataset(
         repo_id=repo_id,
         root=lerobot_root,
@@ -426,29 +456,56 @@ def convert(
     all_selected: list[np.ndarray] = []
     all_excluded: dict[str, list[np.ndarray]] = {}
     excluded_names: dict[str, list[str]] = {}
+    kept_episode_count = 0
 
     try:
-        for ep_index, episode_dir in enumerate(episode_dirs):
-            ep_data = first if ep_index == 0 else load_episode(
-                episode_dir,
-                joint_mode=joint_mode,
-                sync_tolerance_ms=sync_tolerance_ms,
-                max_frames=max_frames_per_episode,
-            )
+        for source_index, episode_dir in enumerate(episode_dirs):
+            if source_index < first_source_index:
+                continue
+            if source_index == first_source_index:
+                ep_data = first
+            else:
+                try:
+                    ep_data = load_episode(
+                        episode_dir,
+                        joint_mode=joint_mode,
+                        sync_tolerance_ms=sync_tolerance_ms,
+                        max_frames=max_frames_per_episode,
+                    )
+                except Exception as exc:
+                    reason = f"{type(exc).__name__}: {exc}"
+                    print(f"[skip source {source_index:03d}] {episode_dir}: {reason}")
+                    skipped_episodes.append(skip_record(raw_dir, episode_dir, reason))
+                    continue
+
             if ep_data.joint_names != first.joint_names:
-                raise ValueError(f"Joint name mismatch in {episode_dir}")
+                reason = f"Joint name mismatch. Expected {first.joint_names}, got {ep_data.joint_names}"
+                print(f"[skip source {source_index:03d}] {episode_dir}: {reason}")
+                skipped_episodes.append(skip_record(raw_dir, episode_dir, reason))
+                continue
+
+            try:
+                episode_task = read_task(episode_dir, task)
+            except Exception as exc:
+                reason = f"failed to read task metadata: {type(exc).__name__}: {exc}"
+                print(f"[skip source {source_index:03d}] {episode_dir}: {reason}")
+                skipped_episodes.append(skip_record(raw_dir, episode_dir, reason))
+                continue
 
             all_selected.extend(ep_data.selected_qpose)
             for key, values in ep_data.excluded_qpose.items():
                 all_excluded.setdefault(key, []).extend(values)
                 excluded_names.setdefault(key, ep_data.excluded_names[key])
 
-            episode_task = read_task(episode_dir, task)
-            print(f"[episode {ep_index:03d}] {episode_dir}: {len(ep_data.frames)} frames, task={episode_task!r}")
+            print(
+                f"[episode {kept_episode_count:03d} source {source_index:03d}] "
+                f"{episode_dir}: {len(ep_data.frames)} frames, task={episode_task!r}"
+            )
             for frame in ep_data.frames:
                 frame["task"] = episode_task
                 dataset.add_frame(frame)
             dataset.save_episode()
+            kept_episode_count += 1
     finally:
         dataset.stop_image_writer()
 
@@ -456,6 +513,12 @@ def convert(
     print(f"Joint mode: {joint_mode}")
     print(f"Training state/action dim: {len(first.joint_names)}")
     print(f"RGB shape in LeRobot: {first.rgb_shape}")
+    print(f"Kept episodes: {kept_episode_count}")
+    if skipped_episodes:
+        skipped_path = dataset.root / "meta" / "skipped_episodes.json"
+        skipped_path.write_text(json.dumps(skipped_episodes, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Skipped episodes: {len(skipped_episodes)}")
+        print(f"Wrote skipped episode reasons: {skipped_path}")
     qpose_stats = write_qpose_mean_json(
         dataset.root,
         joint_mode=joint_mode,

@@ -736,7 +736,7 @@ def make_a3_train_config(
     action_horizon: int = 25,
     batch_size: int = 32,
     save_interval: int = 10_000,
-    model_path: str = "gs://openpi-assets/checkpoints/pi05_base/params",
+    model_path: str = "/data/lyx/hf_cache/openpi-assets/checkpoints/pi05_base/params", # "gs://openpi-assets/checkpoints/pi05_base/params",
 ):
     model_cfg = pi0_config.Pi0Config(action_dim=action_dim, action_horizon=action_horizon, pi05=True)
     return TrainConfig(
@@ -1517,7 +1517,7 @@ _CONFIGS = [
     ),
     make_a3_train_config(
         name="pi05_a3_both",
-        repo_id="local_dataset/a3_0730_test_both",
+        repo_id="local_dataset/a3_0813_both",
         action_dim=a3_policy.A3_BOTH_ACTION_DIM,
         prompt="pick cube",
         steps=30_000,
