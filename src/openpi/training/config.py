@@ -1521,7 +1521,7 @@ _CONFIGS = [
         action_dim=a3_policy.A3_BOTH_ACTION_DIM,
         prompt="pick cube",
         steps=30_000,
-        action_horizon=25,
+        action_horizon=50,
         batch_size=32,
         save_interval=10_000,
     ),
