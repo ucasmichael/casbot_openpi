@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -1517,7 +1518,7 @@ _CONFIGS = [
     ),
     make_a3_train_config(
         name="pi05_a3_both",
-        repo_id="local_dataset/a3_0813_both",
+        repo_id="local_dataset/a3_0819_both",
         action_dim=a3_policy.A3_BOTH_ACTION_DIM,
         prompt="pick cube",
         steps=30_000,

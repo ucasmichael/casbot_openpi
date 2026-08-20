@@ -3,7 +3,7 @@
 
 Training samples contain only:
 - chest RGB image
-- qpose state/action selected by --joint-mode
+- arm command, hand command, and move-waist rpy state/action
 
 The collector also records depth and neck qpose, but this script does not write
 them into LeRobot training samples. At the end it prints per-dimension means for
@@ -18,6 +18,7 @@ import dataclasses
 import json
 from pathlib import Path
 import shutil
+import struct
 from typing import Any, Literal
 
 from lerobot.common.constants import HF_LEROBOT_HOME
@@ -27,9 +28,16 @@ from mcap_ros2.decoder import Decoder
 import numpy as np
 
 RGB_TOPIC = "/hal/chest_front_d457_camera/rgb"
-ARM_TOPIC = "/motion/control/arm_joint_state"
-HAND_TOPIC = "/motion/control/hand_joint_state"
-NECK_TOPIC = "/motion/control/neck_joint_state"
+ARM_TOPIC = "/motion/control/arm_joint_command"
+HAND_TOPIC = "/motion/control/hand_joint_command"
+WAIST_MOVE_TOPIC = (
+    "/motion/control/move_waist/"
+    "pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel"
+)
+ARM_DIM = 14
+HAND_DIM = 20
+WAIST_RPY_NAMES = ["waist_roll", "waist_pitch", "waist_yaw"]
+TRAINING_QPOSE_DIM = ARM_DIM + HAND_DIM + len(WAIST_RPY_NAMES)
 
 CHEST_RGB_KEY = "observation.images.chest_front_rgb"
 JointMode = Literal["left", "right", "both"]
@@ -69,6 +77,14 @@ def stamp_to_ns(stamp: Any) -> int:
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
 
+def message_time_ns(ros_msg: Any, mcap_message: Any) -> int:
+    header = getattr(ros_msg, "header", None)
+    stamp = getattr(header, "stamp", None)
+    if stamp is not None:
+        return stamp_to_ns(stamp)
+    return int(getattr(mcap_message, "log_time"))
+
+
 def decode_rgb_image(msg: Any) -> np.ndarray:
     encoding = msg.encoding.lower()
     if encoding not in {"bgr8", "rgb8"}:
@@ -85,6 +101,96 @@ def decode_rgb_image(msg: Any) -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
+def _read_varint(raw: bytes, index: int) -> tuple[int, int]:
+    shift = 0
+    value = 0
+    while index < len(raw):
+        byte = raw[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, index
+        shift += 7
+        if shift >= 64:
+            break
+    raise ValueError("invalid protobuf varint")
+
+
+def _skip_pb_value(raw: bytes, index: int, wire_type: int) -> int:
+    if wire_type == 0:
+        _, index = _read_varint(raw, index)
+        return index
+    if wire_type == 1:
+        return index + 8
+    if wire_type == 2:
+        length, index = _read_varint(raw, index)
+        return index + length
+    if wire_type == 5:
+        return index + 4
+    raise ValueError(f"unsupported protobuf wire type: {wire_type}")
+
+
+def wrapper_data_bytes(msg: Any) -> bytes:
+    raw = getattr(msg, "data", b"")
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    out = bytearray()
+    for item in raw:
+        if isinstance(item, int):
+            out.append(item & 0xFF)
+        elif isinstance(item, (bytes, bytearray)):
+            out.extend(bytes(item))
+        else:
+            out.append(int(item) & 0xFF)
+    return bytes(out)
+
+
+def parse_move_waist_pb(raw: bytes) -> dict[str, float] | None:
+    values: dict[str, float] = {}
+    index = 0
+    field_names = {
+        2: "waist_pitch",
+        3: "waist_roll",
+        4: "waist_yaw",
+    }
+    try:
+        while index < len(raw):
+            tag, index = _read_varint(raw, index)
+            field_number = tag >> 3
+            wire_type = tag & 0x07
+            if field_number in field_names and wire_type == 1:
+                if index + 8 > len(raw):
+                    return None
+                values[field_names[field_number]] = struct.unpack_from("<d", raw, index)[0]
+                index += 8
+            else:
+                index = _skip_pb_value(raw, index, wire_type)
+            if index > len(raw):
+                return None
+    except Exception:
+        return None
+    if not any(name in values for name in ("waist_pitch", "waist_roll", "waist_yaw")):
+        return None
+    return {
+        "waist_roll": float(values.get("waist_roll", 0.0)),
+        "waist_pitch": float(values.get("waist_pitch", 0.0)),
+        "waist_yaw": float(values.get("waist_yaw", 0.0)),
+    }
+
+
+def parse_move_waist_wrapper(msg: Any) -> np.ndarray:
+    parsed = parse_move_waist_pb(wrapper_data_bytes(msg))
+    if parsed is None:
+        raise ValueError("failed to parse MotionControlMoveWaistChannel protobuf")
+    rpy = np.asarray(
+        [parsed["waist_roll"], parsed["waist_pitch"], parsed["waist_yaw"]],
+        dtype=np.float32,
+    )
+    if not np.isfinite(rpy).all():
+        raise ValueError(f"non-finite MotionControlMoveWaistChannel rpy: {rpy.tolist()}")
+    return rpy
+
+
 def read_mcap_files(mcap_files: list[Path]) -> dict[str, TopicSeries]:
     decoder = Decoder()
     topics: dict[str, TopicSeries] = {}
@@ -94,22 +200,28 @@ def read_mcap_files(mcap_files: list[Path]) -> dict[str, TopicSeries]:
             reader = make_reader(f)
             for schema, channel, message in reader.iter_messages():
                 topic = channel.topic
-                if topic not in {RGB_TOPIC, ARM_TOPIC, HAND_TOPIC, NECK_TOPIC}:
+                if topic not in {RGB_TOPIC, ARM_TOPIC, HAND_TOPIC, WAIST_MOVE_TOPIC}:
                     continue
 
                 ros_msg = decoder.decode(schema, message)
-                if not hasattr(ros_msg, "header"):
-                    continue
-
-                time_ns = stamp_to_ns(ros_msg.header.stamp)
+                time_ns = message_time_ns(ros_msg, message)
                 series = topics.setdefault(topic, TopicSeries())
 
                 if topic == RGB_TOPIC:
                     series.append(time_ns, decode_rgb_image(ros_msg))
                     continue
+                if topic == WAIST_MOVE_TOPIC:
+                    series.append(time_ns, parse_move_waist_wrapper(ros_msg))
+                    continue
 
                 names = list(ros_msg.name)
                 positions = np.asarray(ros_msg.position, dtype=np.float32)
+                if len(names) != positions.shape[0]:
+                    raise ValueError(
+                        f"{topic} has {len(names)} names but {positions.shape[0]} positions in {mcap_file}"
+                    )
+                if not np.isfinite(positions).all():
+                    raise ValueError(f"{topic} has non-finite positions in {mcap_file}: {positions.tolist()}")
                 if series.names is None:
                     series.names = names
                 elif series.names != names:
@@ -138,51 +250,24 @@ def nearest_value(series: TopicSeries, time_ns: int, tolerance_ns: int) -> Any |
     return series.values[best]
 
 
-def side_indices(names: list[str], side: str) -> list[int]:
-    prefix = f"{side}_"
-    return [idx for idx, name in enumerate(names) if name.startswith(prefix)]
-
-
-def select_qpose(
+def make_qpose(
     arm: np.ndarray,
     hand: np.ndarray,
+    waist_rpy: np.ndarray,
     arm_names: list[str],
     hand_names: list[str],
-    joint_mode: JointMode,
-) -> tuple[np.ndarray, list[str], dict[str, np.ndarray], dict[str, list[str]]]:
-    left_arm_idx = side_indices(arm_names, "left")
-    right_arm_idx = side_indices(arm_names, "right")
-    left_hand_idx = side_indices(hand_names, "left")
-    right_hand_idx = side_indices(hand_names, "right")
-
-    groups = {
-        "left": (
-            np.concatenate([arm[left_arm_idx], hand[left_hand_idx]]).astype(np.float32),
-            [*(arm_names[i] for i in left_arm_idx), *(hand_names[i] for i in left_hand_idx)],
-        ),
-        "right": (
-            np.concatenate([arm[right_arm_idx], hand[right_hand_idx]]).astype(np.float32),
-            [*(arm_names[i] for i in right_arm_idx), *(hand_names[i] for i in right_hand_idx)],
-        ),
-    }
-
-    if joint_mode == "left":
-        selected_values, selected_names = groups["left"]
-        excluded = {"right_arm_hand": groups["right"][0]}
-        excluded_names = {"right_arm_hand": groups["right"][1]}
-    elif joint_mode == "right":
-        selected_values, selected_names = groups["right"]
-        excluded = {"left_arm_hand": groups["left"][0]}
-        excluded_names = {"left_arm_hand": groups["left"][1]}
-    elif joint_mode == "both":
-        selected_values = np.concatenate([groups["left"][0], groups["right"][0]]).astype(np.float32)
-        selected_names = [*groups["left"][1], *groups["right"][1]]
-        excluded = {}
-        excluded_names = {}
-    else:
-        raise ValueError(f"Unknown joint mode: {joint_mode}")
-
-    return selected_values, selected_names, excluded, excluded_names
+) -> tuple[np.ndarray, list[str]]:
+    if arm.shape != (ARM_DIM,):
+        raise ValueError(f"{ARM_TOPIC} expected dim {ARM_DIM}, got {arm.shape[0]} names={arm_names}")
+    if hand.shape != (HAND_DIM,):
+        raise ValueError(f"{HAND_TOPIC} expected dim {HAND_DIM}, got {hand.shape[0]} names={hand_names}")
+    if waist_rpy.shape != (len(WAIST_RPY_NAMES),):
+        raise ValueError(f"{WAIST_MOVE_TOPIC} expected rpy dim {len(WAIST_RPY_NAMES)}, got {waist_rpy.shape[0]}")
+    qpose = np.concatenate([arm, hand, waist_rpy]).astype(np.float32)
+    names = [*arm_names, *hand_names, *WAIST_RPY_NAMES]
+    if len(names) != TRAINING_QPOSE_DIM:
+        raise ValueError(f"expected {TRAINING_QPOSE_DIM} qpose names, got {len(names)}: {names}")
+    return qpose, names
 
 
 def load_episode(
@@ -192,19 +277,21 @@ def load_episode(
     sync_tolerance_ms: float,
     max_frames: int | None,
 ) -> EpisodeData:
+    if joint_mode != "both":
+        raise ValueError("A3 command+waist conversion only supports --joint-mode both")
+
     mcap_files = sorted(episode_dir.glob("**/*.mcap"))
     if not mcap_files:
         raise FileNotFoundError(f"No .mcap files found under {episode_dir}")
 
     topics = read_mcap_files(mcap_files)
-    required = [RGB_TOPIC, ARM_TOPIC, HAND_TOPIC]
+    required = [RGB_TOPIC, ARM_TOPIC, HAND_TOPIC, WAIST_MOVE_TOPIC]
     missing = [topic for topic in required if topic not in topics or not topics[topic].values]
     if missing:
         raise ValueError(f"{episode_dir} is missing required topics: {missing}")
 
     arm_names = topics[ARM_TOPIC].names or []
     hand_names = topics[HAND_TOPIC].names or []
-    neck_names = topics[NECK_TOPIC].names or []
     tolerance_ns = int(sync_tolerance_ms * 1_000_000)
 
     frames: list[dict[str, Any]] = []
@@ -217,24 +304,17 @@ def load_episode(
     for rgb_time_ns, rgb in zip(rgb_series.times_ns, rgb_series.values, strict=True):
         arm = nearest_value(topics[ARM_TOPIC], rgb_time_ns, tolerance_ns)
         hand = nearest_value(topics[HAND_TOPIC], rgb_time_ns, tolerance_ns)
-        neck = nearest_value(topics[NECK_TOPIC], rgb_time_ns, tolerance_ns) if NECK_TOPIC in topics else None
-        if arm is None or hand is None:
+        waist_rpy = nearest_value(topics[WAIST_MOVE_TOPIC], rgb_time_ns, tolerance_ns)
+        if arm is None or hand is None or waist_rpy is None:
             continue
 
-        state, names, excluded, names_excluded = select_qpose(arm, hand, arm_names, hand_names, joint_mode)
+        state, names = make_qpose(arm, hand, waist_rpy, arm_names, hand_names)
         if selected_names is None:
             selected_names = names
         elif selected_names != names:
             raise ValueError(f"Selected joint names changed inside {episode_dir}")
 
         selected_qpose.append(state)
-        for key, value in excluded.items():
-            excluded_qpose.setdefault(key, []).append(value)
-            excluded_names.setdefault(key, names_excluded[key])
-        if neck is not None:
-            excluded_qpose.setdefault("neck", []).append(np.asarray(neck, dtype=np.float32))
-            excluded_names.setdefault("neck", neck_names)
-
         frames.append(
             {
                 "observation.state": state,
@@ -249,8 +329,10 @@ def load_episode(
     if not frames or selected_names is None:
         raise ValueError(f"No synchronized frames found for {episode_dir}")
 
-    if len(selected_names) not in {17, 34}:
-        raise ValueError(f"Unexpected selected qpose dim {len(selected_names)} for mode {joint_mode}: {selected_names}")
+    if len(selected_names) != TRAINING_QPOSE_DIM:
+        raise ValueError(
+            f"Unexpected selected qpose dim {len(selected_names)} for mode {joint_mode}: {selected_names}"
+        )
 
     return EpisodeData(
         frames=frames,
@@ -431,7 +513,7 @@ def convert(
             )
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
-            print(f"[skip source {source_index:03d}] {episode_dir}: {reason}")
+            print(f"[warn skip source {source_index:03d}] {episode_dir}: {reason}")
             skipped_episodes.append(skip_record(raw_dir, episode_dir, reason))
             continue
         first_episode_dir = episode_dir
@@ -474,13 +556,13 @@ def convert(
                     )
                 except Exception as exc:
                     reason = f"{type(exc).__name__}: {exc}"
-                    print(f"[skip source {source_index:03d}] {episode_dir}: {reason}")
+                    print(f"[warn skip source {source_index:03d}] {episode_dir}: {reason}")
                     skipped_episodes.append(skip_record(raw_dir, episode_dir, reason))
                     continue
 
             if ep_data.joint_names != first.joint_names:
                 reason = f"Joint name mismatch. Expected {first.joint_names}, got {ep_data.joint_names}"
-                print(f"[skip source {source_index:03d}] {episode_dir}: {reason}")
+                print(f"[warn skip source {source_index:03d}] {episode_dir}: {reason}")
                 skipped_episodes.append(skip_record(raw_dir, episode_dir, reason))
                 continue
 
@@ -488,7 +570,7 @@ def convert(
                 episode_task = read_task(episode_dir, task)
             except Exception as exc:
                 reason = f"failed to read task metadata: {type(exc).__name__}: {exc}"
-                print(f"[skip source {source_index:03d}] {episode_dir}: {reason}")
+                print(f"[warn skip source {source_index:03d}] {episode_dir}: {reason}")
                 skipped_episodes.append(skip_record(raw_dir, episode_dir, reason))
                 continue
 

@@ -28,8 +28,8 @@ import numpy as np
 
 Method = Literal["copy", "hardlink", "symlink"]
 
-ARM_TOPIC = "/motion/control/arm_joint_state"
-HAND_TOPIC = "/motion/control/hand_joint_state"
+ARM_TOPIC = "/motion/control/arm_joint_command"
+HAND_TOPIC = "/motion/control/hand_joint_command"
 ZERO_CHECK_TOPICS = (ARM_TOPIC, HAND_TOPIC)
 
 

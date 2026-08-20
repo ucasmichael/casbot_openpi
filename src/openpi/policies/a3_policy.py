@@ -7,7 +7,7 @@ from openpi import transforms
 from openpi.models import model as _model
 
 A3_ONE_SIDE_ACTION_DIM = 17
-A3_BOTH_ACTION_DIM = 34
+A3_BOTH_ACTION_DIM = 37
 A3_ACTION_DIM = A3_BOTH_ACTION_DIM
 
 
