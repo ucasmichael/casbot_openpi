@@ -1518,7 +1518,7 @@ _CONFIGS = [
     ),
     make_a3_train_config(
         name="pi05_a3_both",
-        repo_id="local_dataset/a3_0819_both",
+        repo_id="local_dataset/a3_0826_both",
         action_dim=a3_policy.A3_BOTH_ACTION_DIM,
         prompt="pick cube",
         steps=30_000,

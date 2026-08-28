@@ -25,8 +25,10 @@ from openpi.policies import policy_config
 from openpi.training import config as training_config
 
 
-DEFAULT_DATASET_ROOT = Path("/data/lyx/dataset/lerobot/local_dataset/a3_0813_both")
-DEFAULT_CHECKPOINT = Path("/data/lyx/casbot_openpi/checkpoints/pi05_a3_both/pi05_a3_both_stack_cups/29999")
+DEFAULT_DATASET_ROOT = Path("/data/lyx/dataset/lerobot/local_dataset/a3_0819_both")
+DEFAULT_CHECKPOINT = Path(
+    "/data/lyx/casbot_openpi/checkpoints/pi05_a3_both/pi05_a3_both_stack_cups_chunk50/29999"
+)
 
 
 def load_action_stats(checkpoint: Path, repo_id: str) -> dict[str, np.ndarray] | None:
@@ -121,11 +123,18 @@ def value_relative_error(abs_error: np.ndarray, target: np.ndarray, min_abs_targ
     return rel
 
 
-def range_relative_error(abs_error: np.ndarray, action_stats: dict[str, np.ndarray] | None, eps: float) -> np.ndarray | None:
+def range_relative_error(
+    abs_error: np.ndarray,
+    action_stats: dict[str, np.ndarray] | None,
+    min_range: float,
+) -> np.ndarray | None:
     if action_stats is None or "q01" not in action_stats or "q99" not in action_stats:
         return None
-    scale = np.maximum(action_stats["q99"] - action_stats["q01"], eps)
-    return abs_error / scale
+    scale = action_stats["q99"] - action_stats["q01"]
+    rel = np.full_like(abs_error, np.nan, dtype=np.float32)
+    valid = scale >= min_range
+    rel[..., valid] = abs_error[..., valid] / scale[valid]
+    return rel
 
 
 def print_error_table(
@@ -153,10 +162,11 @@ def print_error_table(
                 f"{gt[idx]:>12.6f} {pred[idx]:>12.6f} {abs_err[idx]:>12.6f} {value_rel:>11}"
             )
         else:
+            range_rel = "n/a" if np.isnan(range_rel_err[idx]) else f"{range_rel_err[idx] * 100:>10.4f}"
             print(
                 f"{idx:>3}  {name:<34} "
                 f"{gt[idx]:>12.6f} {pred[idx]:>12.6f} {abs_err[idx]:>12.6f} "
-                f"{value_rel:>11} {range_rel_err[idx] * 100:>11.4f}"
+                f"{value_rel:>11} {range_rel:>11}"
             )
 
 
@@ -164,8 +174,6 @@ def summarize_errors(
     abs_errors: np.ndarray,
     value_rel_errors: np.ndarray,
     range_rel_errors: np.ndarray | None,
-    *,
-    arm_dim: int = 7,
 ) -> None:
     print("\nSummary:")
     print(f"  mean_abs_error: {abs_errors.mean():.6f}")
@@ -173,13 +181,27 @@ def summarize_errors(
     print(f"  mean_value_rel_error: {np.nanmean(value_rel_errors) * 100:.4f}%")
     print(f"  max_value_rel_error:  {np.nanmax(value_rel_errors) * 100:.4f}%")
     if range_rel_errors is not None:
-        print(f"  mean_range_rel_error: {range_rel_errors.mean() * 100:.4f}%")
-        print(f"  max_range_rel_error:  {range_rel_errors.max() * 100:.4f}%")
+        print(f"  mean_range_rel_error: {np.nanmean(range_rel_errors) * 100:.4f}%")
+        print(f"  max_range_rel_error:  {np.nanmax(range_rel_errors) * 100:.4f}%")
 
-    arm_indices = [*range(0, arm_dim), *range(17, 17 + arm_dim)]
-    hand_indices = [idx for idx in range(abs_errors.shape[-1]) if idx not in arm_indices]
-    print(f"  arm_mean_abs_error_rad:  {abs_errors[..., arm_indices].mean():.6f}")
-    print(f"  hand_mean_abs_error_raw: {abs_errors[..., hand_indices].mean():.6f}")
+    if abs_errors.shape[-1] == 37:
+        arm_indices = list(range(14))
+        hand_indices = list(range(14, 34))
+        waist_indices = list(range(34, 37))
+        arm_abs = abs_errors[..., arm_indices]
+        hand_abs = abs_errors[..., hand_indices]
+        waist_abs = abs_errors[..., waist_indices]
+        print(f"  arm_mean_abs_error_rad:       {arm_abs.mean():.6f}")
+        print(f"  arm_mean_abs_error_deg:       {np.rad2deg(arm_abs).mean():.4f}")
+        print(f"  arm_max_abs_error_deg:        {np.rad2deg(arm_abs).max():.4f}")
+        print(f"  hand_mean_abs_error_raw:      {hand_abs.mean():.6f}")
+        print(f"  hand_mean_abs_error_pct4095:  {hand_abs.mean() / 4095.0 * 100:.4f}%")
+        print(f"  hand_max_abs_error_pct4095:   {hand_abs.max() / 4095.0 * 100:.4f}%")
+        print(f"  waist_mean_abs_error_rad:     {waist_abs.mean():.6f}")
+        print(f"  waist_mean_abs_error_deg:     {np.rad2deg(waist_abs).mean():.4f}")
+        print(f"  waist_max_abs_error_deg:      {np.rad2deg(waist_abs).max():.4f}")
+    else:
+        print("  grouped_mean_abs_error: skipped; expected 37 action dims")
 
 
 def run(args: argparse.Namespace) -> None:
@@ -203,6 +225,14 @@ def run(args: argparse.Namespace) -> None:
     if action_stats is None:
         print(f"Warning: could not load action q01/q99 from {checkpoint / 'assets' / repo_id / 'norm_stats.json'}")
     print(f"Loading policy config={args.config_name} checkpoint={checkpoint}", flush=True)
+    first_row = frame_rows.iloc[0]
+    first_task = args.prompt or load_task(dataset_root, int(first_row["task_index"]))
+    print(
+        "Evaluating dataset sample "
+        f"episode={int(first_row['episode_index'])} frame={int(first_row['frame_index'])} "
+        f"task={first_task!r} num_frames={args.num_frames}",
+        flush=True,
+    )
     policy = policy_config.create_trained_policy(
         train_config,
         checkpoint,
@@ -239,7 +269,7 @@ def run(args: argparse.Namespace) -> None:
     gt = np.stack(gt_actions)
     abs_err = np.abs(pred - gt)
     value_rel_err = value_relative_error(abs_err, gt, args.value_relative_min)
-    range_rel_err = range_relative_error(abs_err, action_stats, args.range_relative_eps)
+    range_rel_err = range_relative_error(abs_err, action_stats, args.range_relative_min)
 
     if args.num_frames == 1:
         print_error_table(
@@ -292,7 +322,12 @@ def parse_args() -> argparse.Namespace:
         default=1e-3,
         help="Hide value-relative error as n/a when abs(gt) is below this value.",
     )
-    parser.add_argument("--range-relative-eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--range-relative-min",
+        type=float,
+        default=1e-6,
+        help="Show range-relative error as n/a when q99-q01 is below this value.",
+    )
     parser.add_argument("--save-npz", type=Path, default=None)
     return parser.parse_args()
 
