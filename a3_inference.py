@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """
 cd /data/lyx/casbot_openpi
 
@@ -11,6 +9,8 @@ WANDB_MODE=disabled \
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 .venv/bin/python a3_inference.py --num-steps 10
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -24,11 +24,8 @@ import pyarrow.parquet as pq
 from openpi.policies import policy_config
 from openpi.training import config as training_config
 
-
 DEFAULT_DATASET_ROOT = Path("/data/lyx/dataset/lerobot/local_dataset/a3_0819_both")
-DEFAULT_CHECKPOINT = Path(
-    "/data/lyx/casbot_openpi/checkpoints/pi05_a3_both/pi05_a3_both_stack_cups_chunk50/29999"
-)
+DEFAULT_CHECKPOINT = Path("/data/lyx/casbot_openpi/checkpoints/pi05_a3_both/pi05_a3_both_stack_cups_chunk50/29999")
 
 
 def load_action_stats(checkpoint: Path, repo_id: str) -> dict[str, np.ndarray] | None:
@@ -151,16 +148,12 @@ def print_error_table(
         print(f"{'idx':>3}  {'joint':<34} {'gt':>12} {'pred':>12} {'abs_err':>12} {'value_rel%':>11}")
     else:
         print(
-            f"{'idx':>3}  {'joint':<34} {'gt':>12} {'pred':>12} "
-            f"{'abs_err':>12} {'value_rel%':>11} {'range_rel%':>11}"
+            f"{'idx':>3}  {'joint':<34} {'gt':>12} {'pred':>12} {'abs_err':>12} {'value_rel%':>11} {'range_rel%':>11}"
         )
     for idx, name in enumerate(joint_names):
         value_rel = "n/a" if np.isnan(value_rel_err[idx]) else f"{value_rel_err[idx] * 100:>10.4f}"
         if range_rel_err is None:
-            print(
-                f"{idx:>3}  {name:<34} "
-                f"{gt[idx]:>12.6f} {pred[idx]:>12.6f} {abs_err[idx]:>12.6f} {value_rel:>11}"
-            )
+            print(f"{idx:>3}  {name:<34} {gt[idx]:>12.6f} {pred[idx]:>12.6f} {abs_err[idx]:>12.6f} {value_rel:>11}")
         else:
             range_rel = "n/a" if np.isnan(range_rel_err[idx]) else f"{range_rel_err[idx] * 100:>10.4f}"
             print(
@@ -238,6 +231,7 @@ def run(args: argparse.Namespace) -> None:
         checkpoint,
         default_prompt=args.prompt,
         sample_kwargs={"num_steps": args.num_steps},
+        normfix=args.normfix,
     )
     print("Policy loaded. Running inference...", flush=True)
 
@@ -311,6 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--config-name", default="pi05_a3_both")
+    parser.add_argument("--normfix", action="store_true", help="Use the 0902 normfix training normalization rules.")
     parser.add_argument("--episode-index", type=int, default=0)
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--num-frames", type=int, default=1)

@@ -15,6 +15,11 @@ from openpi.shared import normalize as _normalize
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
 
+# Match the normalization used to train the 0902 normfix checkpoint.
+QUANTILE_RANGE_EPS = 1e-3
+STD_EPS = 1e-6
+NORM_ABS_CLIP = 3.0
+
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -111,6 +116,59 @@ class InjectDefaultPrompt(DataTransformFn):
         return data
 
 
+def _normalize_quantile_values(x: np.ndarray, q01: np.ndarray, q99: np.ndarray) -> np.ndarray:
+    x = np.asarray(x)
+    q01 = np.asarray(q01, dtype=x.dtype)
+    q99 = np.asarray(q99, dtype=x.dtype)
+    rng = q99 - q01
+    degenerate = rng < QUANTILE_RANGE_EPS
+    safe_rng = np.where(degenerate, np.ones_like(rng), rng)
+    y = (x - q01) / safe_rng * 2.0 - 1.0
+    y = np.where(degenerate, np.zeros_like(y), y)
+    return np.clip(y, -NORM_ABS_CLIP, NORM_ABS_CLIP)
+
+
+def _unnormalize_quantile_values(x: np.ndarray, q01: np.ndarray, q99: np.ndarray) -> np.ndarray:
+    x = np.clip(np.asarray(x), -NORM_ABS_CLIP, NORM_ABS_CLIP)
+    q01 = np.asarray(q01, dtype=x.dtype)
+    q99 = np.asarray(q99, dtype=x.dtype)
+    rng = q99 - q01
+    degenerate = rng < QUANTILE_RANGE_EPS
+    safe_rng = np.where(degenerate, np.ones_like(rng), rng)
+    y = (x + 1.0) / 2.0 * safe_rng + q01
+    return np.where(degenerate, q01, y)
+
+
+def _normalize_zscore_values(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    x = np.asarray(x)
+    mean = np.asarray(mean, dtype=x.dtype)
+    std = np.asarray(std, dtype=x.dtype)
+    degenerate = std < STD_EPS
+    safe_std = np.where(degenerate, np.ones_like(std), std)
+    y = (x - mean) / safe_std
+    y = np.where(degenerate, np.zeros_like(y), y)
+    return np.clip(y, -NORM_ABS_CLIP, NORM_ABS_CLIP)
+
+
+def _unnormalize_zscore_values(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    x = np.clip(np.asarray(x), -NORM_ABS_CLIP, NORM_ABS_CLIP)
+    mean = np.asarray(mean, dtype=x.dtype)
+    std = np.asarray(std, dtype=x.dtype)
+    degenerate = std < STD_EPS
+    safe_std = np.where(degenerate, np.ones_like(std), std)
+    y = x * safe_std + mean
+    return np.where(degenerate, mean, y)
+
+
+def frozen_dim_indices(stats: NormStats, *, use_quantiles: bool) -> np.ndarray:
+    if use_quantiles:
+        if stats.q01 is None or stats.q99 is None:
+            raise ValueError("Quantile stats are required to detect frozen dims.")
+        span = np.asarray(stats.q99, dtype=np.float32) - np.asarray(stats.q01, dtype=np.float32)
+        return np.flatnonzero(span < QUANTILE_RANGE_EPS)
+    return np.flatnonzero(np.asarray(stats.std) < STD_EPS)
+
+
 @dataclasses.dataclass(frozen=True)
 class Normalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
@@ -118,6 +176,8 @@ class Normalize(DataTransformFn):
     use_quantiles: bool = False
     # If true, will raise an error if any of the keys in the norm stats are not present in the data.
     strict: bool = False
+    # Opt in only for checkpoints trained with the 0902 normfix rules.
+    normfix: bool = False
 
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
@@ -136,12 +196,16 @@ class Normalize(DataTransformFn):
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
+        if self.normfix:
+            return _normalize_zscore_values(x, mean, std)
         return (x - mean) / (std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
         q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
+        if self.normfix:
+            return _normalize_quantile_values(x, q01, q99)
         return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
 
 
@@ -150,6 +214,8 @@ class Unnormalize(DataTransformFn):
     norm_stats: at.PyTree[NormStats] | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantiles: bool = False
+    # Must match the Normalize option used for the same checkpoint.
+    normfix: bool = False
 
     def __post_init__(self):
         if self.norm_stats is not None and self.use_quantiles:
@@ -170,12 +236,19 @@ class Unnormalize(DataTransformFn):
     def _unnormalize(self, x, stats: NormStats):
         mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
         std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
+        if self.normfix:
+            return _unnormalize_zscore_values(x, mean, std)
         return x * (std + 1e-6) + mean
 
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
         q01, q99 = stats.q01, stats.q99
+        if self.normfix:
+            if (dim := q01.shape[-1]) < x.shape[-1]:
+                head = _unnormalize_quantile_values(x[..., :dim], q01, q99)
+                return np.concatenate([head, x[..., dim:]], axis=-1)
+            return _unnormalize_quantile_values(x, q01, q99)
         if (dim := q01.shape[-1]) < x.shape[-1]:
             return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01

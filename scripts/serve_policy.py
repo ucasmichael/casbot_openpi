@@ -5,8 +5,10 @@ import socket
 
 import tyro
 
-from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
+
+# Importing policy before policy_config can segfault in native library initialization on this environment.
+from openpi.policies import policy as _policy  # isort: skip
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
@@ -50,6 +52,8 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
+    # Enable the normalization and output clipping used to train the 0902 normfix checkpoint.
+    normfix: bool = False
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -76,11 +80,11 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, normfix: bool = False) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt, normfix=normfix
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -90,10 +94,13 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                normfix=args.normfix,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.default_prompt, normfix=args.normfix)
 
 
 def main(args: Args) -> None:
