@@ -1,0 +1,73 @@
+{
+  "checkpoint": "/data/lyx/casbot_openpi/checkpoints/pi05_a3_sim2real_hang_blue_cup/pi05_a3_sim2real_hang_blue_cup_h50/20000",
+  "config": "pi05_a3_sim2real_hang_blue_cup",
+  "dataset": "/data/lyx/dataset/lerobot/local_dataset/a3_sim2real_hang_blue_cup_20260914",
+  "frames": 5089,
+  "action_shape": [
+    5089,
+    37
+  ],
+  "mean_abs_error": 3.5298023223876953,
+  "max_abs_error": 443.4879150390625,
+  "mean_value_relative_error_valid": 0.025992050766944885,
+  "mean_range_relative_error_valid": 0.005940224044024944,
+  "hand_out_of_range_values": 7841,
+  "hand_non_integer_values": 50797,
+  "finite_prediction_values": true,
+  "mean_infer_ms_after_jit": 122.24483773047866,
+  "group_metrics": {
+    "left_arm": {
+      "mean_abs_error": 2.7760400644893934e-09,
+      "max_abs_error": 1.8062651818695485e-08,
+      "mean_value_relative_error_pct": null,
+      "mean_range_relative_error_pct": null
+    },
+    "right_arm": {
+      "mean_abs_error": 0.0071674128994345665,
+      "max_abs_error": 0.08998186141252518,
+      "mean_value_relative_error_pct": 4.905065536499023,
+      "mean_range_relative_error_pct": 0.5805042386054993
+    },
+    "left_hand": {
+      "mean_abs_error": 1.6630290200492226e-10,
+      "max_abs_error": 2.0181804671892678e-08,
+      "mean_value_relative_error_pct": 0.0,
+      "mean_range_relative_error_pct": null
+    },
+    "right_hand": {
+      "mean_abs_error": 13.055160522460938,
+      "max_abs_error": 443.4879150390625,
+      "mean_value_relative_error_pct": 3.0621259212493896,
+      "mean_range_relative_error_pct": 0.685276448726654
+    },
+    "waist": {
+      "mean_abs_error": 0.0003040506271645427,
+      "max_abs_error": 0.011671718209981918,
+      "mean_value_relative_error_pct": 16.162290573120117,
+      "mean_range_relative_error_pct": 0.32138487696647644
+    }
+  },
+  "safety_audit": {
+    "hand_out_of_range_total": 7841,
+    "hand_out_of_range_frames": 4142,
+    "arm_hard_limit_total": 135,
+    "arm_hard_limit_frames": 134,
+    "waist_hard_limit_total": 0,
+    "waist_hard_limit_frames": 0,
+    "arm_hard_limit_by_dim": {
+      "right_shoulder_roll_joint": 90,
+      "right_elbow_joint": 2,
+      "right_wrist_yaw_joint": 43
+    },
+    "hand_out_of_range_by_dim": {
+      "left_pinky_wiggles_0": 2274,
+      "right_thumb_rotation_0": 2858,
+      "right_thumb_wiggles_1": 19,
+      "right_index_wiggles_0": 209,
+      "right_index_bent_1": 1,
+      "right_ring_wiggles_0": 68,
+      "right_pinky_wiggles_0": 2412
+    },
+    "sanitization": "clip hand to [0,4095] and round to integer before command; apply wire reorder and robot safety limits"
+  }
+}
