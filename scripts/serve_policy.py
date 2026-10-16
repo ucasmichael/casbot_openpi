@@ -1,3 +1,5 @@
+# ruff: noqa: I001
+
 import dataclasses
 import enum
 import logging
@@ -6,6 +8,7 @@ import socket
 import tyro
 
 from openpi.policies import policy_config as _policy_config
+from openpi.policies import a3_policy as _a3_policy
 
 # Importing policy before policy_config can segfault in native library initialization on this environment.
 from openpi.policies import policy as _policy  # isort: skip
@@ -54,6 +57,8 @@ class Args:
     record: bool = False
     # Enable the normalization and output clipping used to train the 0902 normfix checkpoint.
     normfix: bool = False
+    # Comma-separated A3 sides to execute. Inactive model inputs use checkpoint constants and outputs hold live state.
+    active_sides: str | None = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -91,6 +96,7 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, no
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    active_sides = _a3_policy.parse_active_sides(args.active_sides)
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
@@ -98,8 +104,11 @@ def create_policy(args: Args) -> _policy.Policy:
                 args.policy.dir,
                 default_prompt=args.default_prompt,
                 normfix=args.normfix,
+                active_sides=active_sides,
             )
         case Default():
+            if active_sides is not None:
+                raise ValueError("--active-sides requires policy:checkpoint")
             return create_default_policy(args.env, default_prompt=args.default_prompt, normfix=args.normfix)
 
 

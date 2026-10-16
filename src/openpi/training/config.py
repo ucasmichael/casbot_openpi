@@ -1,4 +1,4 @@
-# 或者 code src/openpi/training/config.py"""See _CONFIGS for the list of available configs."""
+"""See _CONFIGS for the list of available configs."""
 
 import abc
 from collections.abc import Sequence
@@ -1582,15 +1582,12 @@ _CONFIGS = [
         action_dim=a3_policy.A3_BOTH_ACTION_DIM,
         prompt="put the star fruit and spoon in the bowl",
         steps=30_000,
-        name="pi05_a3_0902_move_cup_both",
-        repo_id="local_dataset/a3_0902_move_cup_50traj_both",
-        action_dim=a3_policy.A3_BOTH_ACTION_DIM,
-        prompt="move cup",
-        steps=20_000,
         action_horizon=50,
         batch_size=32,
         save_interval=10_000,
     ),
+    # TODO: real teleoperation data training configs
+    # eg. pi05_a3_realteleop_move_cup
     #
     # RoboArena configs.
     #

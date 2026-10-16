@@ -25,6 +25,7 @@ def create_trained_policy(
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
     normfix: bool = False,
+    active_sides: tuple[str, ...] | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -94,7 +95,7 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    policy = _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
@@ -113,4 +114,21 @@ def create_trained_policy(
         metadata={**(train_config.policy_metadata or {}), "normalization": normalization},
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+    )
+    if active_sides is None:
+        return policy
+
+    from openpi.policies import a3_policy
+
+    inactive_sides = a3_policy.validate_inactive_sides_frozen(
+        active_sides,
+        norm_stats,
+        use_quantiles=data_config.use_quantile_norm,
+    )
+    if not inactive_sides:
+        return policy
+    return a3_policy.A3ScopedPolicy(
+        policy,
+        active_sides=active_sides,
+        training_state=norm_stats["state"].mean,
     )
