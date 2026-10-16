@@ -3,40 +3,43 @@
 from __future__ import annotations
 
 import copy
-import time
-import threading
 from dataclasses import dataclass
+import threading
+import time
 from typing import Any
 
+from joint_msgs.msg import Command
+from joint_msgs.msg import JointCommand
 import numpy as np
 from PIL import Image as PilImage
 import rclpy
-from joint_msgs.msg import Command, JointCommand
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy
+from rclpy.qos import HistoryPolicy
+from rclpy.qos import QoSProfile
+from rclpy.qos import ReliabilityPolicy
 from ros2_plugin_proto.msg import RosMsgWrapper
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import Image
+from sensor_msgs.msg import JointState
 
-from .core import (
-    ARM_NAMES,
-    HAND_NAMES,
-    HAND_STATE_ALIASES,
-    WAIST_STATE_NAMES,
-    ArmTemplate,
-    HandTemplate,
-    Pose,
-    align_positions,
-    encode_waist_payload,
-    parse_waist_payload,
-    validate_arm_template,
-    validate_hand_template,
-    validate_pose,
-    validate_waist_height,
-    wrapper_bytes,
-)
+from .core import ARM_NAMES
+from .core import HAND_NAMES
+from .core import HAND_STATE_ALIASES
+from .core import WAIST_STATE_NAMES
+from .core import ArmTemplate
+from .core import HandTemplate
+from .core import Pose
+from .core import align_positions
+from .core import encode_waist_payload
+from .core import parse_waist_payload
+from .core import validate_arm_template
+from .core import validate_hand_template
+from .core import validate_pose
+from .core import validate_waist_height
+from .core import wrapper_bytes
 from .side_scope import A3SideScope
-
+from .source_state_window import SourceStateWindow
 
 ARM_STATE_TOPIC = "/motion/control/arm_joint_state"
 HAND_STATE_TOPIC = "/motion/control/hand_joint_state"
@@ -47,10 +50,7 @@ CAMERA_TOPIC = "/hal/chest_front_d457_camera/rgb"
 
 ARM_COMMAND_TOPIC = "/motion/control/pnc/arm_joint_command"
 HAND_COMMAND_TOPIC = "/motion/control/hand_joint_command"
-WAIST_COMMAND_TOPIC = (
-    "/motion/control/move_waist/"
-    "pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel"
-)
+WAIST_COMMAND_TOPIC = "/motion/control/move_waist/pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel"
 NECK_COMMAND_TOPIC = "/motion/control/neck_joint_command"
 LEG_COMMAND_TOPIC = "/motion/control/leg_joint_command"
 PRIMARY_COMMAND_TOPICS = (ARM_COMMAND_TOPIC, HAND_COMMAND_TOPIC, WAIST_COMMAND_TOPIC)
@@ -85,6 +85,7 @@ class A3DeploymentNode(Node):
         self._neck_state: tuple[tuple[str, ...], np.ndarray, float] | None = None
         self._leg_state: tuple[tuple[str, ...], np.ndarray, float] | None = None
         self._image: tuple[Image, float] | None = None
+        self._source_state_window = SourceStateWindow()
 
         self._arm_command: tuple[np.ndarray, ArmTemplate, float] | None = None
         self._hand_command: tuple[np.ndarray, float] | None = None
@@ -147,9 +148,7 @@ class A3DeploymentNode(Node):
             except BaseException as error:
                 self._spin_error = error
 
-        self._spin_thread = threading.Thread(
-            target=spin, name="a3-ros-executor", daemon=True
-        )
+        self._spin_thread = threading.Thread(target=spin, name="a3-ros-executor", daemon=True)
         self._spin_thread.start()
 
     def assert_spin_healthy(self) -> None:
@@ -182,6 +181,7 @@ class A3DeploymentNode(Node):
             velocity = align_positions(message.name, message.velocity, ARM_NAMES)
             with self._snapshot_lock:
                 self._arm_state = (values, velocity, time.monotonic())
+                self._source_state_window.add("arm", message, values)
         except Exception as error:
             self._warn_changed("arm state", error)
 
@@ -194,11 +194,10 @@ class A3DeploymentNode(Node):
                 aliases=HAND_STATE_ALIASES,
             )
             if np.any(values < -5.0) or np.any(values > 4100.0):
-                raise ValueError(
-                    f"hand feedback is far outside encoder range: min={values.min()} max={values.max()}"
-                )
+                raise ValueError(f"hand feedback is far outside encoder range: min={values.min()} max={values.max()}")
             with self._snapshot_lock:
                 self._hand_state = (np.clip(values, 0.0, 4095.0), time.monotonic())
+                self._source_state_window.add("hand", message, self._hand_state[0])
         except Exception as error:
             self._warn_changed("hand state", error)
 
@@ -207,6 +206,7 @@ class A3DeploymentNode(Node):
             values = align_positions(message.name, message.position, WAIST_STATE_NAMES)
             with self._snapshot_lock:
                 self._waist_state = (values, time.monotonic())
+                self._source_state_window.add("waist", message, values)
         except Exception as error:
             self._warn_changed("waist state", error)
 
@@ -301,6 +301,11 @@ class A3DeploymentNode(Node):
         pose, _velocity, timestamps = self._measured_snapshot()
         return pose, timestamps
 
+    def source_state_window(self) -> dict[str, Any]:
+        """Return source-stamped state histories while holding the ROS snapshot lock."""
+        with self._snapshot_lock:
+            return self._source_state_window.snapshot()
+
     def projected_command_pose(self, projection: Any) -> Pose:
         measured, velocity, _timestamps = self._measured_snapshot()
         pose = Pose(
@@ -348,7 +353,12 @@ class A3DeploymentNode(Node):
         return LowerLock(neck=neck, leg=leg)
 
     def wait_until_ready(
-        self, *, require_commands: bool, require_lower: bool, timeout_s: float
+        self,
+        *,
+        require_commands: bool,
+        require_lower: bool,
+        timeout_s: float,
+        require_image: bool = True,
     ) -> None:
         deadline = time.monotonic() + timeout_s
         last_error: Exception | None = None
@@ -360,7 +370,8 @@ class A3DeploymentNode(Node):
                     self.command_pose()
                 if require_lower:
                     self.lower_lock()
-                self.image_chw()
+                if require_image:
+                    self.image_chw()
                 return
             except (RuntimeError, ValueError) as error:
                 last_error = error
@@ -376,9 +387,7 @@ class A3DeploymentNode(Node):
                 pose, _velocity, timestamps = self._measured_snapshot()
                 if min(timestamps) > timestamp:
                     return pose
-                last_error = RuntimeError(
-                    "waiting for arm/hand/waist feedback newer than the warm-up barrier"
-                )
+                last_error = RuntimeError("waiting for arm/hand/waist feedback newer than the warm-up barrier")
             except (RuntimeError, ValueError) as error:
                 last_error = error
             time.sleep(0.005)
@@ -414,13 +423,15 @@ class A3DeploymentNode(Node):
         prompt: str,
         *,
         active_sides: tuple[str, ...] | None = None,
+        include_image: bool = True,
     ) -> dict[str, Any]:
         validate_pose(state_pose)
         observation = {
             "state": state_pose.state(),
-            "images": {"chest_rgb": self.image_chw()},
             "prompt": prompt,
         }
+        if include_image:
+            observation["images"] = {"chest_rgb": self.image_chw()}
         if active_sides is not None:
             observation["active_sides"] = list(active_sides)
         return observation
@@ -542,9 +553,7 @@ class A3DeploymentNode(Node):
         return message
 
     @staticmethod
-    def _make_hand_command(
-        pose: Pose, template: HandTemplate, stamp: Any
-    ) -> JointState:
+    def _make_hand_command(pose: Pose, template: HandTemplate, stamp: Any) -> JointState:
         validate_hand_template(template)
         message = JointState()
         message.header.stamp = copy.deepcopy(stamp)

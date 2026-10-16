@@ -10,6 +10,7 @@ POLICY_HOST="${POLICY_HOST:-10.42.10.50}"
 POLICY_PORT="${POLICY_PORT:-8000}"
 POLICY_CONFIG="${POLICY_CONFIG:-pi05_a3_both}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-/home/agilex/cobot_magic/aloha-devel/casbot_openpi/checkpoint/stack_cups_0826_teleop_21traj/20000}"
+CAMERA_SOURCE="${CAMERA_SOURCE:-adu-d457}"
 
 usage() {
     cat <<'EOF'
@@ -22,7 +23,7 @@ Usage:
   deploy/a3/deploy_a3.sh server [serve_policy.py arguments]
 
 Environment overrides:
-  ADU_HOST ADU_USER ADU_REPO POLICY_HOST POLICY_PORT POLICY_CONFIG CHECKPOINT_DIR
+  ADU_HOST ADU_USER ADU_REPO POLICY_HOST POLICY_PORT POLICY_CONFIG CHECKPOINT_DIR CAMERA_SOURCE
 EOF
 }
 
@@ -102,6 +103,7 @@ case "$command" in
         exec "$REPO_ROOT/venv/bin/python" -u scripts/serve_policy.py \
             --port "$POLICY_PORT" \
             --default-prompt "stack cups" \
+            --camera-source "$CAMERA_SOURCE" \
             policy:checkpoint \
             --policy.config "$POLICY_CONFIG" \
             --policy.dir "$CHECKPOINT_DIR" \

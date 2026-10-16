@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from dataclasses import replace
 import fcntl
 import json
 import logging
@@ -22,41 +23,80 @@ from typing import Any
 import numpy as np
 import rclpy
 
-from .core import (
-    DEFAULT_POLICY_ARM_STEP,
-    DEFAULT_POLICY_HAND_STEP,
-    DEFAULT_TRANSITION_ARM_STEP,
-    DEFAULT_TRANSITION_HAND_STEP,
-    DEFAULT_TRANSITION_WAIST_STEP,
-    HARD_MAX_ARM_STEP,
-    HARD_MAX_HAND_STEP,
-    HARD_MAX_WAIST_STEP,
-    MODEL_NAMES,
-    Pose,
-    analyze_action_chunk,
-    bounded_action,
-    interpolate_poses,
-    load_init_pose_config,
-    transition_step_count,
-    validate_action_chunk,
-)
-from .policy_client import InferenceWorker, PolicyClient
-from .ros_node import A3DeploymentNode, LowerLock
-from .side_scope import A3SideScope, parse_active_sides
-
+from .core import DEFAULT_POLICY_ARM_STEP
+from .core import DEFAULT_POLICY_HAND_STEP
+from .core import DEFAULT_TRANSITION_ARM_STEP
+from .core import DEFAULT_TRANSITION_HAND_STEP
+from .core import DEFAULT_TRANSITION_WAIST_STEP
+from .core import HARD_MAX_ARM_STEP
+from .core import HARD_MAX_HAND_STEP
+from .core import HARD_MAX_WAIST_STEP
+from .core import MODEL_NAMES
+from .core import Pose
+from .core import analyze_action_chunk
+from .core import bounded_action
+from .core import interpolate_poses
+from .core import load_init_pose_config
+from .core import transition_step_count
+from .core import validate_action_chunk
+from .policy_client import CAMERA_SOURCE_ADU_D457
+from .policy_client import CAMERA_SOURCE_EXTERNAL_D455
+from .policy_client import InferenceWorker
+from .policy_client import PolicyClient
+from .policy_client import PolicyRequest
+from .ros_node import A3DeploymentNode
+from .ros_node import LowerLock
+from .side_scope import A3SideScope
+from .side_scope import parse_active_sides
 
 CONFIRM_TOKEN = "A3_DEPLOY_REAL_MOTION"
 DEFAULT_INIT_POSE = Path(__file__).with_name("init_pose.json")
 DEFAULT_LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
 
-INTERMEDIATE_ARM_STATE = np.asarray([
-    0.265156, 0.418402, -0.187052, 0.066849, -0.542635, -0.224250, -0.050413,
-    0.333822, -0.405280, 0.187662, 0.026261, 0.353727, -0.281928, 0.152953,
-], dtype=np.float64)
-INTERMEDIATE_HAND_STATE = np.asarray([
-    3198, 3693, 50, 3965, 2, 2, 3968, 4, 65, 4,
-    3194, 119, 25, 37, 1, 2, 3622, 7, 3919, 11,
-], dtype=np.float64)
+INTERMEDIATE_ARM_STATE = np.asarray(
+    [
+        0.265156,
+        0.418402,
+        -0.187052,
+        0.066849,
+        -0.542635,
+        -0.224250,
+        -0.050413,
+        0.333822,
+        -0.405280,
+        0.187662,
+        0.026261,
+        0.353727,
+        -0.281928,
+        0.152953,
+    ],
+    dtype=np.float64,
+)
+INTERMEDIATE_HAND_STATE = np.asarray(
+    [
+        3198,
+        3693,
+        50,
+        3965,
+        2,
+        2,
+        3968,
+        4,
+        65,
+        4,
+        3194,
+        119,
+        25,
+        37,
+        1,
+        2,
+        3622,
+        7,
+        3919,
+        11,
+    ],
+    dtype=np.float64,
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +112,7 @@ class PolicyObservation:
     measured_pose: Pose
     state_ages_ms: tuple[float, float, float]
     source: str
+    source_state_window: dict[str, Any] | None = None
 
 
 class KeyReader:
@@ -79,7 +120,7 @@ class KeyReader:
         self.fd = sys.stdin.fileno()
         self.original: list[Any] | None = None
 
-    def __enter__(self) -> "KeyReader":
+    def __enter__(self) -> KeyReader:
         if not sys.stdin.isatty():
             raise RuntimeError("interactive motion requires a TTY; use ssh -tt")
         self.original = termios.tcgetattr(self.fd)
@@ -110,7 +151,10 @@ def _json_arg(value: Any) -> Any:
     return value
 
 
-def build_run_config(args: argparse.Namespace) -> dict[str, Any]:
+def build_run_config(
+    args: argparse.Namespace,
+    policy_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     effective_args = {
         key: ("<provided>" if key == "confirm_token" and value else _json_arg(value))
         for key, value in vars(args).items()
@@ -136,6 +180,7 @@ def build_run_config(args: argparse.Namespace) -> dict[str, Any]:
             else "last_published_command"
         ),
         "uses_arm_state_to_command_projection": False,
+        "policy_metadata": policy_metadata,
     }
 
 
@@ -147,10 +192,9 @@ class CommandLog:
             json.dumps(run_config, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        self.file = (self.run_dir / "commands.csv").open(
-            "w", encoding="utf-8", newline="", buffering=1
-        )
+        self.file = (self.run_dir / "commands.csv").open("w", encoding="utf-8", newline="", buffering=1)
         self.writer = csv.writer(self.file)
+        self.inference_file = (self.run_dir / "inference.jsonl").open("w", encoding="utf-8", buffering=1)
         self.writer.writerow(
             [
                 "wall_time",
@@ -224,12 +268,41 @@ class CommandLog:
 
     def close(self) -> None:
         self.file.close()
+        self.inference_file.close()
+
+    def write_inference(
+        self,
+        *,
+        chunk: int,
+        response: Any,
+        observation: PolicyObservation,
+    ) -> None:
+        assert response.result is not None
+        record = {
+            "wall_time": time.time(),
+            "chunk": chunk,
+            "round_trip_ms": response.round_trip_ms,
+            "request_bytes": response.request_bytes,
+            "response_bytes": response.response_bytes,
+            "observation_state_source": observation.source,
+            "observation_state_ages_ms": list(observation.state_ages_ms),
+            "observation_state": observation.state_pose.state().tolist(),
+            "server_timing": response.result.get("server_timing"),
+            "observation_alignment": response.result.get("observation_alignment"),
+        }
+        self.inference_file.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy-host", default="10.42.10.50")
     parser.add_argument("--policy-port", type=int, default=8000)
+    parser.add_argument(
+        "--camera-source",
+        choices=(CAMERA_SOURCE_ADU_D457, CAMERA_SOURCE_EXTERNAL_D455),
+        default=CAMERA_SOURCE_ADU_D457,
+        help="adu-d457 preserves the existing robot camera path; external-d455 aligns server RGB with ADU state",
+    )
     parser.add_argument("--prompt", default="stack cups")
     parser.add_argument("--init-pose-file", type=Path, default=DEFAULT_INIT_POSE)
     parser.add_argument("--init-pose-id", default=None)
@@ -245,7 +318,11 @@ def parse_args() -> argparse.Namespace:
         help="request and simulate one action chunk without creating command publishers",
     )
     parser.add_argument("--init-only", action="store_true")
-    parser.add_argument("--two-stage-reset", action="store_true", help="route initialization and reset through the safe intermediate pose")
+    parser.add_argument(
+        "--two-stage-reset",
+        action="store_true",
+        help="route initialization and reset through the safe intermediate pose",
+    )
     parser.add_argument("--confirm-token", default="")
     parser.add_argument("--allow-command-conflicts", action="store_true")
     parser.add_argument(
@@ -293,15 +370,18 @@ def parse_args() -> argparse.Namespace:
         parser.error(str(error))
     if args.policy_port <= 0 or args.policy_port > 65535:
         parser.error("--policy-port must be in [1,65535]")
-    if min(
-        args.wait_ready_timeout,
-        args.connect_timeout,
-        args.infer_timeout,
-        args.max_state_age,
-        args.max_image_age,
-        args.control_rate,
-        args.hold_rate,
-    ) <= 0:
+    if (
+        min(
+            args.wait_ready_timeout,
+            args.connect_timeout,
+            args.infer_timeout,
+            args.max_state_age,
+            args.max_image_age,
+            args.control_rate,
+            args.hold_rate,
+        )
+        <= 0
+    ):
         parser.error("timeouts, ages, and rates must be positive")
     if args.init_duration < 0 or args.reset_duration < 0:
         parser.error("transition durations cannot be negative")
@@ -370,9 +450,7 @@ def transition(
         max_hand_step=min(DEFAULT_TRANSITION_HAND_STEP, args.max_hand_step),
         max_waist_step=min(DEFAULT_TRANSITION_WAIST_STEP, args.max_waist_step),
     )
-    logging.warning(
-        "state=%s steps=%d minimum_estimated_s=%.2f", label, steps, steps / args.hold_rate
-    )
+    logging.warning("state=%s steps=%d minimum_estimated_s=%.2f", label, steps, steps / args.hold_rate)
     frames = interpolate_poses(
         start,
         target,
@@ -423,9 +501,7 @@ def wait_with_hold(
         key = keys.poll()
         if key in accepted:
             return key
-        publish_hold_once(
-            node, pose, candidate=candidate, lower_lock=lower_lock, side_scope=side_scope
-        )
+        publish_hold_once(node, pose, candidate=candidate, lower_lock=lower_lock, side_scope=side_scope)
         _timed_tick(started, args.hold_rate)
     raise RuntimeError("ROS shutdown while holding pose")
 
@@ -443,9 +519,7 @@ def hold_for(
     deadline = time.monotonic() + duration_s
     while rclpy.ok() and time.monotonic() < deadline:
         started = time.monotonic()
-        publish_hold_once(
-            node, pose, candidate=candidate, lower_lock=lower_lock, side_scope=side_scope
-        )
+        publish_hold_once(node, pose, candidate=candidate, lower_lock=lower_lock, side_scope=side_scope)
         _timed_tick(started, args.hold_rate)
 
 
@@ -453,7 +527,10 @@ def capture_policy_observation(
     node: A3DeploymentNode,
     command_pose: Pose,
     args: argparse.Namespace,
+    camera_source: str,
 ) -> PolicyObservation:
+    if camera_source == CAMERA_SOURCE_EXTERNAL_D455 and args.observation_state_source != "measured":
+        raise RuntimeError("external-d455 requires --observation-state-source measured")
     measured, timestamps = node.measured_sample()
     sampled_at = time.monotonic()
     state_ages_ms = tuple((sampled_at - timestamp) * 1000.0 for timestamp in timestamps)
@@ -463,6 +540,27 @@ def capture_policy_observation(
         measured_pose=measured,
         state_ages_ms=state_ages_ms,
         source=args.observation_state_source,
+        source_state_window=(node.source_state_window() if camera_source == CAMERA_SOURCE_EXTERNAL_D455 else None),
+    )
+
+
+def make_policy_request(
+    node: A3DeploymentNode,
+    sample: PolicyObservation,
+    args: argparse.Namespace,
+    side_scope: A3SideScope,
+    camera_source: str,
+) -> PolicyRequest:
+    include_image = camera_source == CAMERA_SOURCE_ADU_D457
+    observation = node.observation(
+        sample.state_pose,
+        args.prompt,
+        active_sides=side_scope.active_sides,
+        include_image=include_image,
+    )
+    return PolicyRequest(
+        observation=observation,
+        source_state_window=sample.source_state_window,
     )
 
 
@@ -471,21 +569,21 @@ def warm_policy(
     command_pose: Pose,
     args: argparse.Namespace,
     side_scope: A3SideScope,
-) -> tuple[np.ndarray, dict[str, Any], PolicyObservation]:
-    sample = capture_policy_observation(node, command_pose, args)
-    observation = node.observation(
-        sample.state_pose, args.prompt, active_sides=side_scope.active_sides
-    )
+) -> tuple[np.ndarray, dict[str, Any], PolicyObservation, str]:
     client = PolicyClient(
         args.policy_host,
         args.policy_port,
         connect_timeout_s=args.connect_timeout,
         infer_timeout_s=args.infer_timeout,
+        expected_camera_source=args.camera_source,
     )
     try:
         started = time.perf_counter()
         metadata = client.open()
-        result, request_bytes, response_bytes = client.infer(observation)
+        camera_source = client.camera_source
+        sample = capture_policy_observation(node, command_pose, args, camera_source)
+        request = make_policy_request(node, sample, args, side_scope, camera_source)
+        result, request_bytes, response_bytes = client.infer(request)
         actions = validate_action_chunk(result.get("actions"))
         logging.info(
             "validate inference shape=%s rtt_ms=%.1f request_bytes=%d response_bytes=%d metadata=%s",
@@ -495,7 +593,8 @@ def warm_policy(
             response_bytes,
             metadata,
         )
-        return actions, metadata, sample
+        logging.info("policy camera_source=%s", camera_source)
+        return actions, metadata, sample, camera_source
     finally:
         client.close()
 
@@ -526,6 +625,7 @@ def execute_policy(
     args: argparse.Namespace,
     command_log: CommandLog,
     side_scope: A3SideScope,
+    camera_source: str,
 ) -> MotionResult:
     current = initial_command
     worker = InferenceWorker(
@@ -534,6 +634,7 @@ def execute_policy(
             args.policy_port,
             connect_timeout_s=args.connect_timeout,
             infer_timeout_s=args.infer_timeout,
+            expected_camera_source=camera_source,
         )
     )
     worker.start()
@@ -542,17 +643,27 @@ def execute_policy(
     try:
         while rclpy.ok():
             try:
-                policy_observation = capture_policy_observation(node, current, args)
-                observation = node.observation(
-                    policy_observation.state_pose,
-                    args.prompt,
-                    active_sides=side_scope.active_sides,
-                )
+                observation_holder: list[PolicyObservation] = []
+
+                def build_external_request(
+                    current_command: Pose = current,
+                    holder: list[PolicyObservation] = observation_holder,
+                ) -> PolicyRequest:
+                    sample = capture_policy_observation(node, current_command, args, camera_source)
+                    holder.append(sample)
+                    return make_policy_request(node, sample, args, side_scope, camera_source)
+
+                if camera_source == CAMERA_SOURCE_EXTERNAL_D455:
+                    inference_request = build_external_request
+                else:
+                    policy_observation = capture_policy_observation(node, current, args, camera_source)
+                    observation_holder.append(policy_observation)
+                    inference_request = make_policy_request(node, policy_observation, args, side_scope, camera_source)
             except (RuntimeError, ValueError) as error:
                 message = f"observation: {error}"
                 logging.error("observation safety stop: %s; holding current command", error)
                 return MotionResult(current, fault=message)
-            worker.submit(chunk, observation)
+            worker.submit(chunk, inference_request)
             response = None
             while response is None:
                 started = time.monotonic()
@@ -563,13 +674,9 @@ def execute_policy(
                     node.measured_pose()
                 except (RuntimeError, ValueError) as error:
                     message = f"inference wait feedback: {error}"
-                    logging.error(
-                        "inference-wait feedback safety stop: %s; holding current command", error
-                    )
+                    logging.error("inference-wait feedback safety stop: %s; holding current command", error)
                     return MotionResult(current, fault=message)
-                publish_hold_once(
-                    node, current, candidate=candidate, lower_lock=lower_lock, side_scope=side_scope
-                )
+                publish_hold_once(node, current, candidate=candidate, lower_lock=lower_lock, side_scope=side_scope)
                 response = worker.poll()
                 _timed_tick(started, args.hold_rate)
             if response.error is not None:
@@ -577,6 +684,11 @@ def execute_policy(
                 logging.error("policy inference failed: %s; holding current command", response.error)
                 return MotionResult(current, fault=message)
             assert response.result is not None
+            if not observation_holder:
+                message = "policy inference completed without a captured observation"
+                logging.error(message)
+                return MotionResult(current, fault=message)
+            policy_observation = observation_holder[-1]
             try:
                 actions = validate_action_chunk(response.result.get("actions"))
             except ValueError as error:
@@ -590,6 +702,11 @@ def execute_policy(
                 response.request_bytes,
                 response.response_bytes,
             )
+            command_log.write_inference(
+                chunk=chunk,
+                response=response,
+                observation=policy_observation,
+            )
             for step, requested in enumerate(actions):
                 started = time.monotonic()
                 if keys.poll() == "q":
@@ -598,10 +715,7 @@ def execute_policy(
                 try:
                     live_pose, state_timestamps = node.measured_sample()
                     sampled_at = time.monotonic()
-                    state_ages_ms = tuple(
-                        (sampled_at - timestamp) * 1000.0
-                        for timestamp in state_timestamps
-                    )
+                    state_ages_ms = tuple((sampled_at - timestamp) * 1000.0 for timestamp in state_timestamps)
                     tracking_reference = current
                     raw_action = np.asarray(requested, dtype=np.float64).copy()
                     scoped_action = side_scope.hold_state(raw_action, live_pose.state())
@@ -738,7 +852,7 @@ def run_policy_dry_run(
         "observation_measured_state": policy_observation.measured_pose.state().tolist(),
         "observation_state_ages_ms": list(policy_observation.state_ages_ms),
         "command_state_tracking": "disabled",
-        "runtime_config": build_run_config(args),
+        "runtime_config": build_run_config(args, metadata),
         "existing_command_publishers": conflicts,
         "init_transition": {
             "two_stage": args.two_stage_reset,
@@ -753,20 +867,15 @@ def run_policy_dry_run(
         "reset_waist_matches_startup": bool(np.array_equal(intermediate_pose.waist, startup_command.waist)),
         "action_chunk": action_report,
     }
-    run_dir = args.log_dir.expanduser() / (
-        time.strftime("%Y%m%d_%H%M%S") + f"_dry_run_{os.getpid()}"
-    )
+    run_dir = args.log_dir.expanduser() / (time.strftime("%Y%m%d_%H%M%S") + f"_dry_run_{os.getpid()}")
     run_dir.mkdir(parents=True, exist_ok=False)
     report_path = run_dir / "dry_run.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     rejected = (
-        action_report["raw_limit_violation_count"]["arm"]
-        + action_report["raw_limit_violation_count"]["waist"]
+        action_report["raw_limit_violation_count"]["arm"] + action_report["raw_limit_violation_count"]["waist"]
     ) > 0
     hand_clipped = action_report["raw_limit_violation_count"]["hand"] > 0
-    status = "DRY_RUN_REJECTED" if rejected else (
-        "DRY_RUN_OK_HAND_CLIPPED" if hand_clipped else "DRY_RUN_OK"
-    )
+    status = "DRY_RUN_REJECTED" if rejected else ("DRY_RUN_OK_HAND_CLIPPED" if hand_clipped else "DRY_RUN_OK")
     action_count = action_report["actions"]
     raw_violations = action_report["raw_limit_violation_count"]
     limited_actions = action_report["delta_limited_action_count"]
@@ -841,6 +950,7 @@ def run(args: argparse.Namespace) -> int:
         node.wait_until_ready(
             require_commands=False,
             require_lower=args.lock_lower,
+            require_image=args.camera_source == CAMERA_SOURCE_ADU_D457,
             timeout_s=args.wait_ready_timeout,
         )
         startup_command, startup_source = capture_startup_command(node)
@@ -854,7 +964,7 @@ def run(args: argparse.Namespace) -> int:
         conflicts = node.publisher_conflicts(include_lower=args.lock_lower)
         logging.warning("existing command publishers=%s", conflicts or "none")
         node.verify_consumers(include_lower=args.lock_lower)
-        warm_actions, policy_metadata, warm_observation = warm_policy(
+        warm_actions, policy_metadata, warm_observation, camera_source = warm_policy(
             node, startup_command, args, side_scope
         )
         side_scope.validate_server_metadata(policy_metadata)
@@ -862,14 +972,10 @@ def run(args: argparse.Namespace) -> int:
         node.wait_for_feedback_after(feedback_barrier, args.wait_ready_timeout)
         startup_command, startup_source = capture_startup_command(node)
         live_pose = node.measured_pose()
-        intermediate_pose = side_scope.hold_pose(
-            build_intermediate_pose(startup_command), live_pose
-        )
+        intermediate_pose = side_scope.hold_pose(build_intermediate_pose(startup_command), live_pose)
         scoped_candidate_pose = side_scope.hold_pose(candidate.pose, live_pose)
         candidate = replace(candidate, pose=scoped_candidate_pose)
-        final_reset = side_scope.hold_pose(
-            final_reset_pose(startup_command, intermediate_pose), live_pose
-        )
+        final_reset = side_scope.hold_pose(final_reset_pose(startup_command, intermediate_pose), live_pose)
         lower_lock = node.lower_lock() if args.lock_lower else None
         logging.info("post-warm startup capture source=%s", startup_source)
         if args.validate_only:
@@ -877,6 +983,7 @@ def run(args: argparse.Namespace) -> int:
                 f"VALIDATE_OK policy={args.policy_host}:{args.policy_port} "
                 f"actions=(50,37) init_pose={candidate.pose_id} "
                 f"startup_source={startup_source} observation_state_source={args.observation_state_source} "
+                f"camera_source={camera_source} "
                 f"command_state_tracking=disabled "
                 f"conflicts={conflicts}",
                 flush=True,
@@ -902,7 +1009,10 @@ def run(args: argparse.Namespace) -> int:
                 "command publisher conflicts detected; stop conflicting control sources or pass "
                 "--allow-command-conflicts after confirming the takeover procedure"
             )
-        command_log = CommandLog(args.log_dir, run_config=build_run_config(args))
+        command_log = CommandLog(
+            args.log_dir,
+            run_config=build_run_config(args, policy_metadata),
+        )
         node.create_command_publishers(include_lower=args.lock_lower)
         publishers_enabled = True
         current_command = startup_command
@@ -913,17 +1023,26 @@ def run(args: argparse.Namespace) -> int:
             init_result = None
             if args.two_stage_reset:
                 init_result = transition(
-                    node, current_command, intermediate_pose,
-                    candidate=candidate, lower_lock=lower_lock,
-                    duration_s=args.init_duration, args=args, keys=keys,
+                    node,
+                    current_command,
+                    intermediate_pose,
+                    candidate=candidate,
+                    lower_lock=lower_lock,
+                    duration_s=args.init_duration,
+                    args=args,
+                    keys=keys,
                     label="MOVE_TO_INIT_INTERMEDIATE",
                     side_scope=side_scope,
                 )
                 current_command = init_result.pose
                 if init_result.fault is None and not init_result.operator_stopped:
                     wait_with_hold(
-                        node, current_command, candidate=candidate, lower_lock=lower_lock,
-                        keys=keys, args=args,
+                        node,
+                        current_command,
+                        candidate=candidate,
+                        lower_lock=lower_lock,
+                        keys=keys,
+                        args=args,
                         prompt="HOLD_INIT_INTERMEDIATE: press Enter to move to initialization target.",
                         accepted={"enter"},
                         side_scope=side_scope,
@@ -953,10 +1072,7 @@ def run(args: argparse.Namespace) -> int:
                     lower_lock=lower_lock,
                     keys=keys,
                     args=args,
-                    prompt=(
-                        f"FAULT_HOLD: {fault}. "
-                        "Press Enter to attempt bounded reset; q exits."
-                    ),
+                    prompt=(f"FAULT_HOLD: {fault}. Press Enter to attempt bounded reset; q exits."),
                     accepted={"enter", "q"},
                     side_scope=side_scope,
                 )
@@ -998,6 +1114,7 @@ def run(args: argparse.Namespace) -> int:
                             args=args,
                             command_log=command_log,
                             side_scope=side_scope,
+                            camera_source=camera_source,
                         )
                         current_command = execution_result.pose
                         fault = execution_result.fault
@@ -1010,10 +1127,7 @@ def run(args: argparse.Namespace) -> int:
                         lower_lock=lower_lock,
                         keys=keys,
                         args=args,
-                        prompt=(
-                            f"FAULT_HOLD: {fault}. "
-                            "Press Enter to attempt bounded reset; q exits."
-                        ),
+                        prompt=(f"FAULT_HOLD: {fault}. Press Enter to attempt bounded reset; q exits."),
                         accepted={"enter", "q"},
                         side_scope=side_scope,
                     )
@@ -1036,33 +1150,52 @@ def run(args: argparse.Namespace) -> int:
             while True:
                 if args.two_stage_reset:
                     reset_result = transition(
-                        node, current_command, intermediate_pose,
-                        candidate=candidate, lower_lock=lower_lock,
-                        duration_s=args.reset_duration, args=args, keys=keys,
+                        node,
+                        current_command,
+                        intermediate_pose,
+                        candidate=candidate,
+                        lower_lock=lower_lock,
+                        duration_s=args.reset_duration,
+                        args=args,
+                        keys=keys,
                         label="RESET_INTERMEDIATE",
                         side_scope=side_scope,
                     )
                     if reset_result.fault is None and not reset_result.operator_stopped:
                         current_command = reset_result.pose
                         wait_with_hold(
-                            node, current_command, candidate=candidate, lower_lock=lower_lock,
-                            keys=keys, args=args,
+                            node,
+                            current_command,
+                            candidate=candidate,
+                            lower_lock=lower_lock,
+                            keys=keys,
+                            args=args,
                             prompt="HOLD_RESET_INTERMEDIATE: press Enter to move to final reset pose.",
                             accepted={"enter"},
                             side_scope=side_scope,
                         )
                         reset_result = transition(
-                            node, current_command, final_reset,
-                            candidate=candidate, lower_lock=lower_lock,
-                            duration_s=args.reset_duration, args=args, keys=keys,
+                            node,
+                            current_command,
+                            final_reset,
+                            candidate=candidate,
+                            lower_lock=lower_lock,
+                            duration_s=args.reset_duration,
+                            args=args,
+                            keys=keys,
                             label="RESET_FINAL",
                             side_scope=side_scope,
                         )
                 else:
                     reset_result = transition(
-                        node, current_command, startup_command,
-                        candidate=candidate, lower_lock=lower_lock,
-                        duration_s=args.reset_duration, args=args, keys=keys,
+                        node,
+                        current_command,
+                        startup_command,
+                        candidate=candidate,
+                        lower_lock=lower_lock,
+                        duration_s=args.reset_duration,
+                        args=args,
+                        keys=keys,
                         label="RESETTING",
                         side_scope=side_scope,
                     )
@@ -1077,10 +1210,7 @@ def run(args: argparse.Namespace) -> int:
                     lower_lock=lower_lock,
                     keys=keys,
                     args=args,
-                    prompt=(
-                        f"FAULT_HOLD: {reason}. "
-                        "Press Enter to retry bounded reset; q exits."
-                    ),
+                    prompt=(f"FAULT_HOLD: {reason}. Press Enter to retry bounded reset; q exits."),
                     accepted={"enter", "q"},
                     side_scope=side_scope,
                 )

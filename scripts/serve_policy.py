@@ -4,6 +4,7 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import Literal
 
 import tyro
 
@@ -12,6 +13,9 @@ from openpi.policies import a3_policy as _a3_policy
 
 # Importing policy before policy_config can segfault in native library initialization on this environment.
 from openpi.policies import policy as _policy  # isort: skip
+from openpi.serving import a3_policy_server
+from openpi.serving import a3_rgb_source
+from openpi.serving import a3_time_alignment
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
@@ -59,6 +63,13 @@ class Args:
     normfix: bool = False
     # Comma-separated A3 sides to execute. Inactive model inputs use checkpoint constants and outputs hold live state.
     active_sides: str | None = None
+    # RGB source. The default preserves the existing ADU chest-D457 path.
+    camera_source: Literal["adu-d457", "external-d455"] = "adu-d457"
+    # External D455 settings; used only when camera_source=external-d455.
+    camera_serial: str = "318122300934"
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_fps: int = 30
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -124,12 +135,35 @@ def main(args: Args) -> None:
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
 
-    server = websocket_policy_server.WebsocketPolicyServer(
-        policy=policy,
-        host="0.0.0.0",
-        port=args.port,
-        metadata=policy_metadata,
-    )
+    if args.camera_source == a3_time_alignment.CAMERA_SOURCE_EXTERNAL_D455:
+        camera = a3_rgb_source.BufferedRGBSource(
+            a3_rgb_source.RGBSourceConfig(
+                serial=args.camera_serial,
+                width=args.camera_width,
+                height=args.camera_height,
+                fps=args.camera_fps,
+            )
+        )
+        server = a3_policy_server.A3ExternalCameraPolicyServer(
+            policy=policy,
+            camera=camera,
+            host="0.0.0.0",
+            port=args.port,
+            metadata=policy_metadata,
+        )
+    else:
+        policy_metadata = {
+            **policy_metadata,
+            "a3_observation": {
+                "camera_source": a3_time_alignment.CAMERA_SOURCE_ADU_D457,
+            },
+        }
+        server = websocket_policy_server.WebsocketPolicyServer(
+            policy=policy,
+            host="0.0.0.0",
+            port=args.port,
+            metadata=policy_metadata,
+        )
     server.serve_forever()
 
 

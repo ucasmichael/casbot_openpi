@@ -51,3 +51,10 @@ def test_active_sides_cli_is_forwarded_for_checkpoint(monkeypatch):
     serve_policy.create_policy(args)
 
     assert calls[0][1]["active_sides"] == ("right",)
+
+
+@pytest.mark.parametrize("camera_source", ["adu-d457", "external-d455"])
+def test_camera_source_cli_is_explicit(camera_source):
+    args = tyro.cli(serve_policy.Args, args=["--camera-source", camera_source])
+
+    assert args.camera_source == camera_source
