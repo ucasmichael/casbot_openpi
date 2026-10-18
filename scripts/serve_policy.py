@@ -1,12 +1,21 @@
+# ruff: noqa: I001
+
 import dataclasses
 import enum
 import logging
 import socket
+from typing import Literal
 
 import tyro
 
-from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
+from openpi.policies import a3_policy as _a3_policy
+
+# Importing policy before policy_config can segfault in native library initialization on this environment.
+from openpi.policies import policy as _policy  # isort: skip
+from openpi.serving import a3_policy_server
+from openpi.serving import a3_rgb_source
+from openpi.serving import a3_time_alignment
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
@@ -50,6 +59,17 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
+    # Enable the normalization and output clipping used to train the 0902 normfix checkpoint.
+    normfix: bool = False
+    # Comma-separated A3 sides to execute. Inactive model inputs use checkpoint constants and outputs hold live state.
+    active_sides: str | None = None
+    # RGB source. The default preserves the existing ADU chest-D457 path.
+    camera_source: Literal["adu-d457", "external-d455"] = "adu-d457"
+    # External D455 settings; used only when camera_source=external-d455.
+    camera_serial: str = "318122300934"
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_fps: int = 30
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -76,24 +96,31 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, normfix: bool = False) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt, normfix=normfix
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    active_sides = _a3_policy.parse_active_sides(args.active_sides)
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                normfix=args.normfix,
+                active_sides=active_sides,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            if active_sides is not None:
+                raise ValueError("--active-sides requires policy:checkpoint")
+            return create_default_policy(args.env, default_prompt=args.default_prompt, normfix=args.normfix)
 
 
 def main(args: Args) -> None:
@@ -108,12 +135,35 @@ def main(args: Args) -> None:
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
 
-    server = websocket_policy_server.WebsocketPolicyServer(
-        policy=policy,
-        host="0.0.0.0",
-        port=args.port,
-        metadata=policy_metadata,
-    )
+    if args.camera_source == a3_time_alignment.CAMERA_SOURCE_EXTERNAL_D455:
+        camera = a3_rgb_source.BufferedRGBSource(
+            a3_rgb_source.RGBSourceConfig(
+                serial=args.camera_serial,
+                width=args.camera_width,
+                height=args.camera_height,
+                fps=args.camera_fps,
+            )
+        )
+        server = a3_policy_server.A3ExternalCameraPolicyServer(
+            policy=policy,
+            camera=camera,
+            host="0.0.0.0",
+            port=args.port,
+            metadata=policy_metadata,
+        )
+    else:
+        policy_metadata = {
+            **policy_metadata,
+            "a3_observation": {
+                "camera_source": a3_time_alignment.CAMERA_SOURCE_ADU_D457,
+            },
+        }
+        server = websocket_policy_server.WebsocketPolicyServer(
+            policy=policy,
+            host="0.0.0.0",
+            port=args.port,
+            metadata=policy_metadata,
+        )
     server.serve_forever()
 
 

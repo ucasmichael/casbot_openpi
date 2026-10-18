@@ -1586,6 +1586,8 @@ _CONFIGS = [
         batch_size=32,
         save_interval=20_000,
     ),
+    # TODO: real teleoperation data training configs
+    # eg. pi05_a3_realteleop_move_cup
     #
     # RoboArena configs.
     #

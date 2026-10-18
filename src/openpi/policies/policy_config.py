@@ -6,10 +6,12 @@ from typing import Any
 import jax.numpy as jnp
 
 import openpi.models.model as _model
-import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
+
+# Importing policy before checkpoints can segfault in native library initialization on this environment.
+import openpi.policies.policy as _policy  # isort: skip
 import openpi.transforms as transforms
 
 
@@ -22,6 +24,8 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    normfix: bool = False,
+    active_sides: tuple[str, ...] | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +41,8 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        normfix: Use the 0902 training rules for frozen dimensions and clipping on both transforms.
+                 Leave disabled for checkpoints trained with the original normalization.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -63,6 +69,23 @@ def create_trained_policy(
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
+    normalization = {
+        "mode": "normfix" if normfix else "legacy",
+        "use_quantiles": data_config.use_quantile_norm,
+        "asset_id": data_config.asset_id,
+    }
+    if normfix:
+        normalization.update(
+            quantile_range_eps=transforms.QUANTILE_RANGE_EPS,
+            std_eps=transforms.STD_EPS,
+            norm_abs_clip=transforms.NORM_ABS_CLIP,
+            frozen_dims={
+                key: transforms.frozen_dim_indices(stats, use_quantiles=data_config.use_quantile_norm).tolist()
+                for key, stats in transforms.flatten_dict(norm_stats).items()
+            },
+        )
+    logging.info("Normalization: %s", normalization)
+
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
         try:
@@ -72,23 +95,40 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    policy = _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,
-            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm, normfix=normfix),
             *data_config.model_transforms.inputs,
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm, normfix=normfix),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        metadata={**(train_config.policy_metadata or {}), "normalization": normalization},
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+    )
+    if active_sides is None:
+        return policy
+
+    from openpi.policies import a3_policy
+
+    inactive_sides = a3_policy.validate_inactive_sides_frozen(
+        active_sides,
+        norm_stats,
+        use_quantiles=data_config.use_quantile_norm,
+    )
+    if not inactive_sides:
+        return policy
+    return a3_policy.A3ScopedPolicy(
+        policy,
+        active_sides=active_sides,
+        training_state=norm_stats["state"].mean,
     )

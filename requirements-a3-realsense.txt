@@ -1,0 +1,2 @@
+# Optional policy-server dependency for --camera-source external-d455.
+pyrealsense2==2.58.4.10922
