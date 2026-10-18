@@ -22,9 +22,23 @@ to the existing OpenPI A3 training order:
 left_arm7 + right_arm7 + left_hand10 + right_hand10 + waist[roll, pitch, yaw]
 ```
 
-Both `observation.state` and `action` contain the same absolute executable 37D
-qpose. The OpenPI dataloader builds the future action chunk from `action` using
-the configured horizon.
+For refined sessions under `*_refined/pi05_format_data`, `observation.state`
+is the measured PhysX robot state sampled at the RGB timestamp. OmniHand joint
+angles are encoded with the official SDK into the deployed `[0, 4095]`
+actuator units. `action` remains the absolute executable command from
+`a3_qpose.json`; the OpenPI dataloader builds the future action chunk from
+`action` using the configured horizon. Both fields are stored in the episode
+Parquet files under `data/`. The separate `*.command_state_backup` directory
+is only a rollback copy of the pre-repair command state and is not read by
+training.
+
+To repair an already converted refined dataset, run:
+
+```bash
+.venv/bin/python examples/a3_sim2real/repair_refined_states.py \
+  --dataset-root /data/lyx/hand_obj_tracking/data/move_cup_20260913_refined/pi05_format_data/lerobot/local_dataset/a3_sim2real_move_cup_20260913_refined \
+  --omnihand-site-packages /data/lyx/hand_obj_tracking/.conda/envs/robot_synthesis/lib/python3.11/site-packages
+```
 
 `put_spoon_20260913` is marked as right-hand-only by all of its source files.
 The two dual-arm datasets are `put_pass_bowl_20260913` and

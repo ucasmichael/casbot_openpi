@@ -4,13 +4,16 @@
 The retarget pipeline stores executable commands in ``a3_qpose.json`` using
 the A3 wire order (waist, arms, hands). OpenPI's existing A3 data path uses
 arms, hands, then waist, so this converter validates and reorders every frame
-before writing it as both the observation state and absolute action target.
+before writing the absolute action target. Refined episodes use the synchronized
+PhysX joint measurements for observation.state, with hand angles encoded using
+the official OmniHand SDK in the same actuator units as the deployed state.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 from pathlib import Path
@@ -69,6 +72,15 @@ TRAINING_WAIST_NAMES = ("waist_roll", "waist_pitch", "waist_yaw")
 TRAINING_NAMES = ARM_NAMES + HAND_NAMES + TRAINING_WAIST_NAMES
 ACTION_DIM = len(TRAINING_NAMES)
 VALID_SIDES = frozenset({"left", "right"})
+PHYSICS_HAND_NAMES = tuple(
+    f"{side}_{suffix}_joint"
+    for side in ("L", "R")
+    for suffix in (
+        "thumb_roll", "thumb_abad", "thumb_mcp", "index_abad", "index_pip",
+        "middle_pip", "ring_abad", "ring_pip", "pinky_abad", "pinky_pip",
+    )
+)
+PHYSICS_STATE_NAMES = WIRE_WAIST_NAMES + ARM_NAMES + PHYSICS_HAND_NAMES
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,8 +89,9 @@ class FrameSpec:
     source_frame_index: int
     timestamp_ns: int
     action: np.ndarray
+    state: np.ndarray
     rgb_path: Path
-    depth_path: Path
+    depth_path: Path | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -88,12 +101,13 @@ class EpisodeSpec:
     frames: tuple[FrameSpec, ...]
     source_schema: str
     source_fps: int | None
+    state_source: str
 
 
 @dataclasses.dataclass(frozen=True)
 class ImageSpec:
     rgb_shape: tuple[int, int, int]
-    depth_shape: tuple[int, int, int]
+    depth_shape: tuple[int, int, int] | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,6 +146,52 @@ def wire_to_training_qpose(values: Any, *, label: str = "a3_qpose_37d") -> np.nd
     return np.concatenate((qpose[3:17], qpose[17:37], qpose[[1, 2, 0]])).astype(np.float32)
 
 
+@functools.lru_cache(maxsize=1)
+def physics_hand_solvers() -> tuple[Any, Any]:
+    from omnihand.omnihand_2025 import OmniHand2025Solver
+
+    return OmniHand2025Solver(True), OmniHand2025Solver(False)
+
+
+def load_physics_states(episode_dir: Path, action_rows: list[dict[str, Any]]) -> np.ndarray:
+    """Read measured joints by name, checking alignment with every RGB/action row."""
+    path = episode_dir / "physics_robot_render_state.json"
+    payload = load_json_object(path)
+    if payload.get("schema") != "hand_obj_tracking.physics_robot_render_state.v1":
+        raise ValueError(f"Unexpected physics state schema in {path}")
+    if payload.get("source") != "recorded_full_a3_physx_joint_positions":
+        raise ValueError(f"Expected recorded PhysX joint positions in {path}")
+    names = payload["joint_names"]
+    if len(set(names)) != len(names) or set(PHYSICS_STATE_NAMES) - set(names):
+        raise ValueError(f"Missing or duplicate physics joint names in {path}")
+    rows = payload["frames"]
+    if len(rows) < len(action_rows):
+        raise ValueError(f"Physics state frame count is too short in {path}")
+    indices = [names.index(name) for name in PHYSICS_STATE_NAMES]
+    solvers = physics_hand_solvers()
+    states = []
+    for action_row, row in zip(action_rows, rows):
+        if (row["frame"], int(row["timestamp_ns"])) != (
+            action_row["frame"], int(action_row["timestamp_ns"])
+        ):
+            raise ValueError(f"Physics state frame/timestamp mismatch in {path}: {action_row['frame']}")
+        joints = np.asarray(row["joint_positions"], dtype=np.float64)
+        if joints.shape != (len(names),) or not np.isfinite(joints).all():
+            raise ValueError(f"Invalid measured physics joints in {path}: {row['frame']}")
+        wire = joints[indices].copy()
+        for side_index, solver in enumerate(solvers):
+            start = 17 + 10 * side_index
+            encode = getattr(solver, "active_joint_angles_to_actuator_input", None)
+            if encode is None:
+                encode = solver.active_joint_pos_to_actuator_input
+            raw = np.asarray(encode(wire[start : start + 10].tolist()), dtype=np.float64)
+            if raw.shape != (10,) or not np.isfinite(raw).all():
+                raise ValueError(f"Invalid OmniHand encoding in {path}: {row['frame']}")
+            wire[start : start + 10] = np.clip(np.rint(raw), 0, 4095)
+        states.append(wire_to_training_qpose(wire, label=f"{path}: {row['frame']}"))
+    return np.asarray(states, dtype=np.float32)
+
+
 def discover_episode_dirs(raw_dir: Path) -> list[Path]:
     raw_dir = raw_dir.expanduser().resolve()
     if (raw_dir / "a3_qpose.json").is_file():
@@ -157,7 +217,7 @@ def load_episode_spec(
     episode_dir: Path,
     *,
     rgb_name: str,
-    depth_name: str,
+    depth_name: str | None,
     expected_fps: int,
     max_frames: int | None = None,
 ) -> EpisodeSpec:
@@ -190,6 +250,11 @@ def load_episode_spec(
         if max_frames <= 0:
             raise ValueError("max_frames must be positive")
         rows = rows[:max_frames]
+
+    physics_path = episode_dir / "physics_robot_render_state.json"
+    if (episode_dir / "pi05_materialization.json").is_file() and not physics_path.is_file():
+        raise FileNotFoundError(f"Refined episode is missing measured PhysX state: {physics_path}")
+    physics_states = load_physics_states(episode_dir, rows) if physics_path.is_file() else None
 
     frames: list[FrameSpec] = []
     seen_frames: set[str] = set()
@@ -224,8 +289,8 @@ def load_episode_spec(
 
         frame_dir = episode_dir / "all_data" / frame
         rgb_path = frame_dir / rgb_name
-        depth_path = frame_dir / depth_name
-        missing = [str(path) for path in (rgb_path, depth_path) if not path.is_file()]
+        depth_path = frame_dir / depth_name if depth_name is not None else None
+        missing = [str(path) for path in (rgb_path, depth_path) if path is not None and not path.is_file()]
         if missing:
             raise FileNotFoundError(f"{action_path}: frame {frame} is missing files: {missing}")
         action = wire_to_training_qpose(
@@ -238,6 +303,7 @@ def load_episode_spec(
                 source_frame_index=source_frame_index,
                 timestamp_ns=timestamp_ns,
                 action=action,
+                state=physics_states[row_index] if physics_states is not None else action.copy(),
                 rgb_path=rgb_path,
                 depth_path=depth_path,
             )
@@ -249,6 +315,7 @@ def load_episode_spec(
         frames=tuple(frames),
         source_schema=schema,
         source_fps=source_fps,
+        state_source="physics_robot_render_state.json" if physics_states is not None else "a3_qpose.json",
     )
 
 
@@ -270,6 +337,8 @@ def load_depth(path: Path) -> Image.Image:
 
 def inspect_image_spec(frame: FrameSpec) -> ImageSpec:
     rgb = load_rgb(frame.rgb_path)
+    if frame.depth_path is None:
+        return ImageSpec(rgb_shape=rgb.shape, depth_shape=None)
     depth = load_depth(frame.depth_path)
     if rgb.shape[:2] != depth.size[::-1]:
         raise ValueError(
@@ -323,12 +392,13 @@ def create_dataset(
             "shape": image_spec.rgb_shape,
             "names": ["height", "width", "channels"],
         },
-        DEPTH_KEY: {
+    }
+    if image_spec.depth_shape is not None:
+        features[DEPTH_KEY] = {
             "dtype": mode,
             "shape": image_spec.depth_shape,
             "names": ["height", "width", "channels"],
-        },
-    }
+        }
     return LeRobotDataset.create(
         repo_id=repo_id,
         root=dataset_root,
@@ -387,6 +457,7 @@ def episode_manifest_record(raw_dir: Path, episode: EpisodeSpec) -> dict[str, An
         "source_schema": episode.source_schema,
         "source_fps": episode.source_fps,
         "active_sides": list(episode.active_sides),
+        "state_source": episode.state_source,
         "frame_count": len(episode.frames),
         "first_frame": episode.frames[0].frame,
         "last_frame": episode.frames[-1].frame,
@@ -397,7 +468,7 @@ def preflight(
     raw_dir: Path,
     *,
     rgb_name: str,
-    depth_name: str,
+    depth_name: str | None,
     fps: int,
     max_episodes: int | None,
     max_frames_per_episode: int | None,
@@ -456,7 +527,7 @@ def write_metadata(
     task: str,
     fps: int,
     rgb_name: str,
-    depth_name: str,
+    depth_name: str | None,
     episodes: list[EpisodeSpec],
     skipped: list[dict[str, str]],
     qpose_sum: np.ndarray,
@@ -474,7 +545,10 @@ def write_metadata(
         "source_order": list(A3_WIRE_NAMES),
         "training_order": list(TRAINING_NAMES),
         "mapping": "source[3:17] + source[17:37] + source[[1,2,0]]",
-        "observation_action_policy": "observation.state and action contain the same absolute executable qpose",
+        "observation_action_policy": (
+            "observation.state uses synchronized measured PhysX joints when available; "
+            "legacy episodes use command state; action is the absolute executable command"
+        ),
         "episode_count": len(episodes),
         "frame_count": frame_count,
         "episodes": [episode_manifest_record(raw_dir, episode) for episode in episodes],
@@ -512,6 +586,7 @@ def convert(
     robot_type: str = "a3_sim2real",
     rgb_name: str = "rgb_out.png",
     depth_name: str = "depth.png",
+    rgb_only: bool = False,
     max_episodes: int | None = None,
     max_frames_per_episode: int | None = None,
     skip_invalid: bool = False,
@@ -528,11 +603,12 @@ def convert(
     if mode not in {"image", "video"}:
         raise ValueError("mode must be 'image' or 'video'")
     validate_repo_id(repo_id)
+    selected_depth_name = None if rgb_only else depth_name
 
     episodes, skipped, image_spec = preflight(
         raw_dir,
         rgb_name=rgb_name,
-        depth_name=depth_name,
+        depth_name=selected_depth_name,
         fps=fps,
         max_episodes=max_episodes,
         max_frames_per_episode=max_frames_per_episode,
@@ -563,22 +639,25 @@ def convert(
         for episode_index, episode in enumerate(episodes):
             for frame in episode.frames:
                 rgb = load_rgb(frame.rgb_path)
-                depth = load_depth(frame.depth_path)
-                current_spec = ImageSpec(rgb_shape=rgb.shape, depth_shape=(*depth.size[::-1], 1))
+                depth = load_depth(frame.depth_path) if frame.depth_path is not None else None
+                current_spec = ImageSpec(
+                    rgb_shape=rgb.shape,
+                    depth_shape=(*depth.size[::-1], 1) if depth is not None else None,
+                )
                 if current_spec != image_spec:
                     raise ValueError(
                         f"Image shape changed at {episode.path.name}/{frame.frame}: "
                         f"expected {image_spec}, got {current_spec}"
                     )
-                dataset.add_frame(
-                    {
-                        "observation.state": frame.action.copy(),
-                        "action": frame.action.copy(),
-                        RGB_KEY: rgb,
-                        DEPTH_KEY: depth,
-                        "task": task,
-                    }
-                )
+                values = {
+                    "observation.state": frame.state.copy(),
+                    "action": frame.action.copy(),
+                    RGB_KEY: rgb,
+                    "task": task,
+                }
+                if depth is not None:
+                    values[DEPTH_KEY] = depth
+                dataset.add_frame(values)
                 qpose_sum += frame.action
                 written_frames += 1
             if mode == "image":
@@ -601,7 +680,7 @@ def convert(
         task=task,
         fps=fps,
         rgb_name=rgb_name,
-        depth_name=depth_name,
+        depth_name=selected_depth_name,
         episodes=episodes,
         skipped=skipped,
         qpose_sum=qpose_sum,
@@ -626,6 +705,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-type", default="a3_sim2real")
     parser.add_argument("--rgb-name", default="rgb_out.png", help="Per-frame synthesized RGB filename.")
     parser.add_argument("--depth-name", default="depth.png", help="Per-frame uint16 depth filename.")
+    parser.add_argument("--rgb-only", action="store_true", help="Export RGB and qpose without a depth feature (PI05 refined sessions).")
     parser.add_argument("--max-episodes", type=int, default=None, help="Debug option for smoke tests.")
     parser.add_argument("--max-frames-per-episode", type=int, default=None, help="Debug option for smoke tests.")
     parser.add_argument(
