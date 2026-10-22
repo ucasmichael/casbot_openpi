@@ -4,7 +4,8 @@
 Training samples contain only:
 - chest RGB image
 - chest depth image
-- arm command, hand command, and move-waist rpy state/action
+- arm/hand/waist feedback state, with historical-command fallback
+- arm command, hand command, and move-waist rpy action
 
 The collector also records other qpose topics, but this script does not write
 them into LeRobot training samples. At the end it prints per-dimension means for
@@ -29,23 +30,23 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left
+from bisect import bisect_right
 import dataclasses
+from functools import lru_cache
 import json
-import xml.etree.ElementTree as ET
+import logging
 from pathlib import Path
 import shutil
 import struct
 import types
-from functools import lru_cache
 from typing import Any, Literal
+import xml.etree.ElementTree as ET
 
 from datasets import Dataset
 from datasets import concatenate_datasets
 from lerobot.common.constants import HF_LEROBOT_HOME
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset_module
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from mcap.reader import make_reader
-from mcap_ros2.decoder import Decoder
 import numpy as np
 from PIL import Image
 from scipy.spatial.transform import Rotation as SciRot
@@ -54,6 +55,11 @@ RGB_TOPIC = "/hal/chest_front_d457_camera/rgb"
 DEPTH_TOPIC = "/hal/chest_front_d457_camera/depth"
 ARM_TOPIC = "/motion/control/pnc/arm_joint_command"
 HAND_TOPIC = "/motion/control/hand_joint_command"
+ARM_STATE_TOPIC = "/motion/control/arm_joint_state"
+HAND_STATE_TOPIC = "/motion/control/hand_joint_state"
+WAIST_STATE_TOPIC = "/motion/control/waist_joint_state"
+FEEDBACK_TOPICS = (ARM_STATE_TOPIC, HAND_STATE_TOPIC, WAIST_STATE_TOPIC)
+STATE_COMPONENTS = ("arm", "hand", "waist")
 WAIST_MOVE_TOPIC = (
     "/motion/control/move_waist/"
     "pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel"
@@ -135,6 +141,42 @@ A3_RIGHT_CHAIN = (
 )
 
 
+ARM_NAMES = [name for name, _ in (*A3_LEFT_CHAIN[:7], *A3_RIGHT_CHAIN[:7])]
+NAME_ALIASES = {
+    "left_thumb_roration_0": "left_thumb_rotation_0",
+    **{f"{name}_joint": name for name in WAIST_RPY_NAMES},
+}
+
+
+def ordered_positions(names: list[str], positions: Any, expected: list[str], *, unnamed: bool = False) -> np.ndarray:
+    names = [NAME_ALIASES.get(name, name) for name in names]
+    if not names and unnamed:
+        names = expected
+    values = np.asarray(positions, dtype=np.float32)
+    if values.shape != (len(expected),) or len(names) != len(expected) or set(names) != set(expected):
+        raise ValueError(f"Joint layout mismatch: expected {expected}, got {names}, shape={values.shape}")
+    if not np.isfinite(values).all():
+        raise ValueError("Nonfinite joint positions")
+    return values[[names.index(name) for name in expected]]
+
+
+def checked_hand(values: np.ndarray, tolerance: float, *, feedback: bool) -> tuple[np.ndarray, int]:
+    if not np.isfinite(values).all() or np.any(values < -tolerance) or np.any(values > 4095 + tolerance):
+        raise ValueError("Out-of-range or nonfinite hand positions")
+    clipped = int(np.count_nonzero((values < 0) | (values > 4095))) if feedback else 0
+    return (np.clip(values, 0, 4095) if clipped else values), clipped
+
+
+def warn_feedback_fallback(episode: Path, used: dict[str, int], unavailable: dict[str, int]) -> None:
+    for component in STATE_COMPONENTS:
+        if used[component] or unavailable[component]:
+            logging.warning(
+                "%s: %s feedback missing, invalid or outside tolerance; used historical command "
+                "at or before observation for %d source frames; %d frames had no usable historical command.",
+                episode, component, used[component], unavailable[component],
+            )
+
+
 @dataclasses.dataclass
 class TopicSeries:
     times_ns: list[int] = dataclasses.field(default_factory=list)
@@ -156,6 +198,7 @@ class EpisodeData:
     excluded_qpose: dict[str, list[np.ndarray]]
     excluded_names: dict[str, list[str]]
     trim_info: dict[str, Any]
+    state_info: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -570,49 +613,62 @@ def parse_joint_state_positions(msg: Any, *, fallback_names: list[str] | None = 
 
 
 def read_mcap_files(mcap_files: list[Path]) -> dict[str, TopicSeries]:
+    # IPC conversion also uses the qpose and LeRobot helpers in this module.
+    from mcap.reader import make_reader
+    from mcap_ros2.decoder import Decoder
+
     decoder = Decoder()
     topics: dict[str, TopicSeries] = {}
-
+    expected_names = {
+        ARM_TOPIC: ARM_NAMES, ARM_STATE_TOPIC: ARM_NAMES,
+        HAND_TOPIC: DEFAULT_HAND_NAMES, HAND_STATE_TOPIC: DEFAULT_HAND_NAMES,
+        WAIST_STATE_TOPIC: WAIST_RPY_NAMES,
+    }
+    required = {RGB_TOPIC, DEPTH_TOPIC, ARM_TOPIC, HAND_TOPIC, WAIST_MOVE_TOPIC, *FEEDBACK_TOPICS}
     for mcap_file in mcap_files:
         with mcap_file.open("rb") as f:
             reader = make_reader(f)
             for schema, channel, message in reader.iter_messages():
                 topic = channel.topic
-                if topic not in {RGB_TOPIC, DEPTH_TOPIC, ARM_TOPIC, HAND_TOPIC, WAIST_MOVE_TOPIC}:
+                if topic not in required:
                     continue
-
-                ros_msg = decoder.decode(schema, message)
-                time_ns = message_time_ns(ros_msg, message)
                 series = topics.setdefault(topic, TopicSeries())
-
-                if topic == RGB_TOPIC:
-                    series.append(time_ns, decode_rgb_image(ros_msg))
-                    continue
-                if topic == DEPTH_TOPIC:
-                    series.append(time_ns, decode_depth_image(ros_msg))
-                    continue
-                if topic == WAIST_MOVE_TOPIC:
-                    series.append(time_ns, parse_move_waist_wrapper(ros_msg))
-                    continue
-
-                if topic == ARM_TOPIC:
-                    names, positions = parse_pnc_arm_joint_command(ros_msg)
-                else:
-                    names, positions = parse_joint_state_positions(ros_msg, fallback_names=DEFAULT_HAND_NAMES)
-                if len(names) != positions.shape[0]:
-                    raise ValueError(
-                        f"{topic} has {len(names)} names but {positions.shape[0]} positions in {mcap_file}"
+                ros_msg = None
+                try:
+                    ros_msg = decoder.decode(schema, message)
+                    time_ns = message_time_ns(ros_msg, message)
+                    if topic == RGB_TOPIC:
+                        series.append(time_ns, decode_rgb_image(ros_msg))
+                        continue
+                    if topic == DEPTH_TOPIC:
+                        series.append(time_ns, decode_depth_image(ros_msg))
+                        continue
+                    if topic == WAIST_MOVE_TOPIC:
+                        series.append(time_ns, parse_move_waist_wrapper(ros_msg))
+                        continue
+                    if topic == ARM_TOPIC:
+                        names, positions = parse_pnc_arm_joint_command(ros_msg)
+                    else:
+                        names, positions = parse_joint_state_positions(ros_msg)
+                    positions = ordered_positions(
+                        names, positions, expected_names[topic], unnamed=topic == HAND_TOPIC,
                     )
-                if not np.isfinite(positions).all():
-                    raise ValueError(f"{topic} has non-finite positions in {mcap_file}: {positions.tolist()}")
-                if series.names is None:
-                    series.names = names
-                elif series.names != names:
-                    raise ValueError(f"Joint names changed inside {mcap_file}: {topic}")
+                except (ValueError, TypeError, AttributeError, KeyError) as exc:
+                    if topic not in FEEDBACK_TOPICS:
+                        raise
+                    # Keep an invalid sample at its timestamp so it causes fallback,
+                    # rather than silently selecting a more distant feedback sample.
+                    try:
+                        invalid_time = message_time_ns(ros_msg, message)
+                    except (UnboundLocalError, AttributeError, TypeError, ValueError):
+                        invalid_time = int(message.log_time)
+                    series.append(invalid_time, None)
+                    logging.debug("Invalid feedback %s in %s: %s", topic, mcap_file, exc)
+                    continue
+                series.names = expected_names[topic]
                 series.append(time_ns, positions)
-
     for series in topics.values():
-        order = np.argsort(series.times_ns)
+        order = np.argsort(series.times_ns, kind="stable")
         series.times_ns = [series.times_ns[i] for i in order]
         series.values = [series.values[i] for i in order]
     return topics
@@ -631,6 +687,13 @@ def nearest_value(series: TopicSeries, time_ns: int, tolerance_ns: int) -> Any |
     if abs(series.times_ns[best] - time_ns) > tolerance_ns:
         return None
     return series.values[best]
+
+
+def previous_value(series: TopicSeries, time_ns: int, tolerance_ns: int) -> Any | None:
+    index = bisect_right(series.times_ns, time_ns) - 1
+    if index < 0 or time_ns - series.times_ns[index] > tolerance_ns:
+        return None
+    return series.values[index]
 
 
 def make_qpose(
@@ -660,9 +723,17 @@ def load_episode(
     sync_tolerance_ms: float,
     max_frames: int | None,
     projection_trim: ProjectionTrimConfig,
+    state_source: str = "feedback",
+    command_alignment: str = "nearest",
+    hand_range_tolerance: float = 1.0,
 ) -> EpisodeData:
     if joint_mode != "both":
         raise ValueError("A3 command+waist conversion only supports --joint-mode both")
+
+    if state_source not in {"feedback", "command"} or command_alignment not in {"nearest", "previous"}:
+        raise ValueError("Invalid state source or command alignment")
+    if not np.isfinite(sync_tolerance_ms) or sync_tolerance_ms < 0 or not np.isfinite(hand_range_tolerance) or hand_range_tolerance < 0:
+        raise ValueError("Tolerances must be finite and nonnegative")
 
     mcap_files = sorted(episode_dir.glob("**/*.mcap"))
     if not mcap_files:
@@ -681,29 +752,62 @@ def load_episode(
     synced_records: list[dict[str, Any]] = []
     selected_names: list[str] | None = None
 
+    fallback_used = dict.fromkeys(STATE_COMPONENTS, 0)
+    fallback_unavailable = dict.fromkeys(STATE_COMPONENTS, 0)
+    command_topics = (ARM_TOPIC, HAND_TOPIC, WAIST_MOVE_TOPIC)
+    command_selector = previous_value if command_alignment == "previous" else nearest_value
     rgb_series = topics[RGB_TOPIC]
-    for rgb_time_ns, rgb in zip(rgb_series.times_ns, rgb_series.values, strict=True):
-        arm = nearest_value(topics[ARM_TOPIC], rgb_time_ns, tolerance_ns)
-        hand = nearest_value(topics[HAND_TOPIC], rgb_time_ns, tolerance_ns)
-        waist_rpy = nearest_value(topics[WAIST_MOVE_TOPIC], rgb_time_ns, tolerance_ns)
+    for source_index, (rgb_time_ns, rgb) in enumerate(zip(rgb_series.times_ns, rgb_series.values, strict=True)):
+        commands = [command_selector(topics[t], rgb_time_ns, tolerance_ns) for t in command_topics]
         depth = nearest_value(topics[DEPTH_TOPIC], rgb_time_ns, tolerance_ns)
-        if arm is None or hand is None or waist_rpy is None or depth is None:
+        if any(v is None for v in commands) or depth is None:
             continue
-
-        state, names = make_qpose(arm, hand, waist_rpy, arm_names, hand_names)
-        if selected_names is None:
-            selected_names = names
-        elif selected_names != names:
-            raise ValueError(f"Selected joint names changed inside {episode_dir}")
-
-        synced_records.append(
-            {
-                "rgb": rgb,
-                "depth": depth,
-                "state": state,
-                "names": names,
-            }
-        )
+        try:
+            commands[1], _ = checked_hand(commands[1], hand_range_tolerance, feedback=False)
+        except ValueError:
+            continue
+        action, names = make_qpose(*commands, arm_names, hand_names)
+        state_parts = []
+        sources = {}
+        clipped = 0
+        valid = True
+        for component, feedback_topic, command_topic, command in zip(
+            STATE_COMPONENTS, FEEDBACK_TOPICS, command_topics, commands, strict=True,
+        ):
+            source = "command" if state_source == "command" else "feedback"
+            value = command if state_source == "command" else nearest_value(
+                topics.get(feedback_topic, TopicSeries()), rgb_time_ns, tolerance_ns,
+            )
+            if value is not None and component == "hand" and state_source == "feedback":
+                try:
+                    value, clipped = checked_hand(value, hand_range_tolerance, feedback=True)
+                except ValueError:
+                    value = None
+            if value is None:
+                value = previous_value(topics[command_topic], rgb_time_ns, tolerance_ns)
+                if value is not None and component == "hand":
+                    try:
+                        value, _ = checked_hand(value, hand_range_tolerance, feedback=False)
+                    except ValueError:
+                        value = None
+                if value is None:
+                    fallback_unavailable[component] += 1
+                    valid = False
+                    continue
+                fallback_used[component] += 1
+                source = "historical_command"
+            state_parts.append(value)
+            sources[component] = source
+        if not valid:
+            continue
+        state, _ = make_qpose(*state_parts, arm_names, hand_names)
+        selected_names = names
+        synced_records.append({
+            "rgb": rgb, "depth": depth, "state": state, "action": action,
+            "source_frame_index": source_index, "rgb_time_ns": rgb_time_ns,
+            "state_sources": sources, "feedback_hand_clipped_values": clipped,
+        })
+    warn_feedback_fallback(episode_dir, fallback_used, fallback_unavailable)
 
     if not synced_records or selected_names is None:
         raise ValueError(f"No synchronized frames found for {episode_dir}")
@@ -745,7 +849,7 @@ def load_episode(
     frames = [
         {
             "observation.state": record["state"],
-            "action": record["state"].copy(),
+            "action": record["action"],
             CHEST_RGB_KEY: record["rgb"],
             CHEST_DEPTH_KEY: record["depth"],
         }
@@ -771,6 +875,16 @@ def load_episode(
         excluded_qpose={},
         excluded_names={},
         trim_info=trim_info,
+        state_info={
+            "state_source": state_source,
+            "state_semantics": "command_target" if state_source == "command" else "feedback_with_historical_command_fallback",
+            "command_alignment": command_alignment,
+            "sync_tolerance_ms": sync_tolerance_ms,
+            "fallback_counts": {c: sum(r["state_sources"][c] == "historical_command" for r in kept_records) for c in STATE_COMPONENTS},
+            "fallback_unavailable_counts": fallback_unavailable,
+            "feedback_hand_clipped_values": sum(r["feedback_hand_clipped_values"] for r in kept_records),
+            "frames": [{k: r[k] for k in ("source_frame_index", "rgb_time_ns", "state_sources")} for r in kept_records],
+        },
     )
 
 
@@ -955,7 +1069,10 @@ def convert(
     mode: str = "image",
     robot_type: str = "a3",
     joint_mode: JointMode = "both",
-    sync_tolerance_ms: float = 80.0,
+    sync_tolerance_ms: float = 100.0,
+    state_source: str = "feedback",
+    command_alignment: str = "nearest",
+    hand_range_tolerance: float = 1.0,
     projection_trim_enabled: bool = True,
     projection_urdf_path: Path = Path("/data/lyx/backup/a3_ultra_t2d0/urdf/model_planning.urdf"),
     projection_pad_frames: int = 0,
@@ -993,6 +1110,9 @@ def convert(
                 sync_tolerance_ms=sync_tolerance_ms,
                 max_frames=max_frames_per_episode,
                 projection_trim=projection_trim,
+                state_source=state_source,
+                command_alignment=command_alignment,
+                hand_range_tolerance=hand_range_tolerance,
             )
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
@@ -1019,6 +1139,8 @@ def convert(
         dataset_config=DatasetConfig(use_videos=mode == "video"),
     )
 
+    all_actions: list[np.ndarray] = []
+    state_records: list[dict[str, Any]] = []
     all_selected: list[np.ndarray] = []
     all_excluded: dict[str, list[np.ndarray]] = {}
     excluded_names: dict[str, list[str]] = {}
@@ -1039,6 +1161,9 @@ def convert(
                         sync_tolerance_ms=sync_tolerance_ms,
                         max_frames=max_frames_per_episode,
                         projection_trim=projection_trim,
+                        state_source=state_source,
+                        command_alignment=command_alignment,
+                        hand_range_tolerance=hand_range_tolerance,
                     )
                 except Exception as exc:
                     reason = f"{type(exc).__name__}: {exc}"
@@ -1061,6 +1186,8 @@ def convert(
                 continue
 
             all_selected.extend(ep_data.selected_qpose)
+            all_actions.extend(frame["action"] for frame in ep_data.frames)
+            state_records.append({"source": str(episode_dir), "episode_index": kept_episode_count, **ep_data.state_info})
             for key, values in ep_data.excluded_qpose.items():
                 all_excluded.setdefault(key, []).extend(values)
                 excluded_names.setdefault(key, ep_data.excluded_names[key])
@@ -1117,6 +1244,12 @@ def convert(
             encoding="utf-8",
         )
         print(f"Wrote projection trim stats: {trim_path}")
+    (dataset.root / "meta" / "state_sources.json").write_text(
+        json.dumps({"episodes": state_records}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+    (dataset.root / "meta" / "action_means.json").write_text(
+        json.dumps(qpose_mean_record(all_actions, first.joint_names), indent=2) + "\n", encoding="utf-8",
+    )
     qpose_stats = write_qpose_mean_json(
         dataset.root,
         joint_mode=joint_mode,
@@ -1142,6 +1275,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-type", default="a3")
     parser.add_argument("--joint-mode", choices=["left", "right", "both"], default="both", help="Select left arm+hand, right arm+hand, or both arms+hands.")
     parser.add_argument("--sync-tolerance-ms", type=float, default=100.0)
+    parser.add_argument("--state-source", choices=["feedback", "command"], default="feedback", help="Feedback state, with warning and historical-command fallback if unavailable.")
+    parser.add_argument("--command-alignment", choices=["nearest", "previous"], default="nearest", help="Action alignment; feedback fallback always uses previous command.")
+    parser.add_argument("--hand-range-tolerance", type=float, default=1.0)
     parser.add_argument("--no-projection-trim", dest="projection_trim_enabled", action="store_false", default=argparse.SUPPRESS, help="Disable projection-based head/tail trimming.")
     parser.add_argument("--projection-urdf-path", type=Path, default=Path("/data/lyx/backup/a3_ultra_t2d0/urdf/model_planning.urdf"), help="Path to the A3 URDF used for FK-based visibility trimming.")
     parser.add_argument("--projection-pad-frames", type=int, default=0, help="Extra frames to keep before tag1 and after tag2.")

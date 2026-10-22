@@ -1,4 +1,5 @@
 mcap
 mcap-ros2-support
 numpy
+h5py
 lerobot
